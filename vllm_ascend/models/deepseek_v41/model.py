@@ -7,7 +7,6 @@ from __future__ import annotations
 import typing
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
@@ -97,6 +96,9 @@ from .engram.embedding import (
 from .engram.layer import AscendEngram
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .indexer import DeepseekV41Indexer
+from .topology import DeepseekV41LayerRole as DeepseekV41LayerRole
+from .topology import DeepseekV41Topology as DeepseekV41Topology
+from .topology import build_layer_plan as build_layer_plan
 
 
 def _engram_enabled_for_runtime(config, vllm_config) -> bool:
@@ -446,47 +448,6 @@ def init_attention_projections(self, config, quant_config, prefix, reduce_result
     )
 
 
-@dataclass(frozen=True)
-class DeepseekV41LayerRole:
-    """The attention and future Engram responsibilities of one backbone layer."""
-
-    layer_idx: int
-    compress_ratio: int
-    kv_source_layer: int | None
-    index_source_layer: int | None
-    is_kv_source: bool
-    is_index_source: bool
-    is_candidate_source: bool
-    uses_candidate_filter: bool
-    engram_slot: int | None
-
-    @property
-    def has_long_context(self) -> bool:
-        return self.compress_ratio > 0
-
-
-@dataclass(frozen=True)
-class DeepseekV41Topology:
-    """Validated, immutable model-wide source/consumer topology."""
-
-    layers: tuple[DeepseekV41LayerRole, ...]
-    kv_source_layer_ids: tuple[int, ...]
-    index_source_layer_ids: tuple[int, ...]
-    candidate_source_layer_id: int
-    candidate_topk_blocks: int
-    candidate_block_size: int
-    index_topk: int
-
-    def layer(self, layer_idx: int) -> DeepseekV41LayerRole:
-        return self.layers[layer_idx]
-
-    def kv_consumers(self, source_layer: int) -> tuple[int, ...]:
-        return tuple(role.layer_idx for role in self.layers if role.kv_source_layer == source_layer)
-
-    def index_consumers(self, source_layer: int) -> tuple[int, ...]:
-        return tuple(role.layer_idx for role in self.layers if role.index_source_layer == source_layer)
-
-
 class DeepseekV41SharedAttentionState:
     """Per-forward handoff between index sources and their consumer layers."""
 
@@ -501,64 +462,6 @@ class DeepseekV41SharedAttentionState:
         # them. Keeping the storage intact avoids replay depending on Python
         # state mutation and preserves a fixed address for ACL Graph.
         return None
-
-
-def _latest_source(layer_idx: int, sources: tuple[int, ...]) -> int | None:
-    return next((source for source in reversed(sources) if source <= layer_idx), None)
-
-
-def build_layer_plan(config: Any) -> DeepseekV41Topology:
-    """Build and validate the V4.1 layer-sharing graph from a text config.
-
-    ``config`` is the parsed text-model config. Extra compression ratios for
-    speculative layers are allowed,
-    but only the first ``num_hidden_layers`` entries describe the backbone.
-    """
-
-    num_layers = int(config.num_hidden_layers)
-    ratios = tuple(config.compress_ratios)
-    kv_sources = tuple(config.kv_source_layer_ids)
-    index_sources = tuple(config.index_source_layer_ids)
-    engram_layers = tuple(config.engram_layer_ids)
-    candidate_source = int(config.candidate_source_layer_id)
-    candidate_topk_blocks = int(config.candidate_topk_blocks)
-    candidate_block_size = int(config.candidate_block_size)
-    index_topk = int(config.index_topk)
-
-    ratios = ratios[:num_layers]
-
-    engram_slots = {layer_idx: slot for slot, layer_idx in enumerate(engram_layers)}
-    roles: list[DeepseekV41LayerRole] = []
-    for layer_idx, ratio in enumerate(ratios):
-        kv_source = _latest_source(layer_idx, kv_sources) if ratio else None
-        index_source = _latest_source(layer_idx, index_sources) if ratio else None
-
-        roles.append(
-            DeepseekV41LayerRole(
-                layer_idx=layer_idx,
-                compress_ratio=ratio,
-                kv_source_layer=kv_source,
-                index_source_layer=index_source,
-                is_kv_source=layer_idx in kv_sources,
-                is_index_source=layer_idx in index_sources,
-                is_candidate_source=layer_idx == candidate_source,
-                # Consumer layers inherit the selection policy of their index
-                # source.  For example, layer 26 reuses layer 24 TopK, and that
-                # TopK was computed inside layer 20's candidate blocks.
-                uses_candidate_filter=index_source is not None and index_source > candidate_source,
-                engram_slot=engram_slots.get(layer_idx),
-            )
-        )
-
-    return DeepseekV41Topology(
-        layers=tuple(roles),
-        kv_source_layer_ids=kv_sources,
-        index_source_layer_ids=index_sources,
-        candidate_source_layer_id=candidate_source,
-        candidate_topk_blocks=candidate_topk_blocks,
-        candidate_block_size=candidate_block_size,
-        index_topk=index_topk,
-    )
 
 
 class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
