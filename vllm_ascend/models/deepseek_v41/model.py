@@ -659,6 +659,11 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
             index_k_source_prefix=self.index_k_source_prefix,
         )
         self.v41_layer_name = f"{prefix}.v41_attn"
+        # Layerwise execution identity for the DSV4.1 MP connector: the
+        # execution-layer ID used by the layerwise transfer plan. It is a
+        # distinct attribute on purpose — bindings are read from this object,
+        # never derived from v41_layer_name by string rewriting.
+        self.layerwise_execution_layer = f"{prefix}.attn"
         context = vllm_config.compilation_config.static_forward_context
         context[self.v41_layer_name] = self
 

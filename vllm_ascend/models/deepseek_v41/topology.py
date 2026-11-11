@@ -63,6 +63,30 @@ class DeepseekV41CacheResource:
     consumer_layers: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class DSV41LayerBinding:
+    """Explicit identity binding for one DSV4.1 attention object.
+
+    The three names come from the live ``DeepseekV41Attention`` object at
+    binding time; none is derived from another by string rewriting:
+
+    - ``attention_prefix``: the module's construction prefix
+      (``model.layers.<i>.self_attn``);
+    - ``dispatch_layer_name``: the custom-op dispatch key registered in the
+      static forward context (``<attention_prefix>.v41_attn``);
+    - ``execution_layer_name``: the layerwise plan's execution-layer ID
+      (``<attention_prefix>.attn``).
+
+    The binding builder validates these equalities on the object's own
+    attributes and rejects any mismatch, instead of normalizing names.
+    """
+
+    layer_idx: int
+    attention_prefix: str
+    dispatch_layer_name: str
+    execution_layer_name: str
+
+
 def build_cache_resources(
     topology: DeepseekV41Topology,
     *,

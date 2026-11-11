@@ -30,6 +30,11 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
+from vllm_ascend.attention.dsv41_layerwise_admission import (
+    guard_layer_admission,
+    notify_layer_produced,
+    wait_for_layer_load,
+)
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -65,7 +70,14 @@ def dsa_v41_forward(
     """Execute V4.1 attention behind an explicit graph side-effect boundary."""
     forward_context = get_forward_context()
     attn = forward_context.no_compile_layers[layer_name]
+    # Layerwise MP hooks (design §5.2): wait for the layer's retrieved KV
+    # before its first cache read, then fail-closed admission, then record
+    # the produced KV after the attention computes. Both are no-ops unless
+    # the DSV4.1 layerwise connector enabled its registry in this process.
+    wait_for_layer_load(layer_name)
+    guard_layer_admission(layer_name)
     attn.v41_impl.forward(attn, None, hidden_states, output)
+    notify_layer_produced(layer_name)
 
 
 def dsa_v41_forward_fake(

@@ -124,6 +124,16 @@ def register_connector():
         "MooncakeLayerwiseConnector",
     )
 
+    # DSV4.1 layerwise KV transfer (LMCache-Ascend multiprocess mode).
+    # Registered under its own config name only: it never overrides the
+    # stock LMCache connector, and the lmcache_ascend module is imported
+    # lazily by the factory only when this connector is selected.
+    KVConnectorFactory.register_connector(
+        "DSV41LayerwiseMPConnector",
+        "lmcache_ascend.integration.vllm.dsv41_mp_connector",
+        "DSV41LayerwiseMPConnector",
+    )
+
     _register_with_class_name_alias(
         "UCMConnector",
         "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector.connector",
