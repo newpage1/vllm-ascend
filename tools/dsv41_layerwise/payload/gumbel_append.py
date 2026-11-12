@@ -24,4 +24,3 @@ def _log1p_neg_stable(value):
 
     direct = tl.log(tl.maximum(1.0 - value, 5.960464477539063e-08))
     return tl.where(value < 0.25, series, direct)
-

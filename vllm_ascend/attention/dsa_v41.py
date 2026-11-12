@@ -36,6 +36,7 @@ from vllm_ascend.attention.dsv41_layerwise_admission import (
     notify_layer_produced,
     wait_for_layer_load,
 )
+from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -85,6 +86,15 @@ def dsa_v41_forward(
     guard_layer_admission(layer_name)
     attn.v41_impl.forward(attn, None, hidden_states, output)
     notify_layer_produced(layer_name)
+    # Hand the freshly written KV to the layerwise connector (t75): the
+    # engine-side store half of the S0 loop. The stock MP wrapper turns
+    # this into per-layer STORE specs over the wire; without this call the
+    # V4.1 lane is the only attention family that never stores (t65 gap).
+    # Guards inside (kv-transfer group + connector metadata) keep engine
+    # init and non-layerwise serving unchanged.
+    maybe_save_kv_layer_to_connector(
+        layer_name, list(getattr(attn.long_kv_cache, "kv_cache", ()) or ())
+    )
 
 
 def dsa_v41_forward_fake(
