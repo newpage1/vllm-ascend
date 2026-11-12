@@ -133,6 +133,7 @@ from vllm_ascend.attention.dsv41_layerwise_c2 import (
     NOT_BOUND,
     bind_model_forward_step,
     clear_step_request_view,
+    install_boundary_provider,
 )
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -5058,6 +5059,11 @@ class NPUModelRunner(GPUModelRunner):
                     layer.impl.bind_copy_sfa_kv_cache(self.sparse_kv_offload_manager, layer_name)
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+            # S1: once the layerwise transport has the plan, hand it the
+            # provider that turns a boundary token into the real rows this
+            # engine wrote. Every other connector lacks set_boundary_provider,
+            # so this stays a no-op for stock serving.
+            install_boundary_provider()
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,

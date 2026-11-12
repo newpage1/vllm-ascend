@@ -162,6 +162,40 @@ codec 时所有钩子立即返回，stock 路径、graph capture、profile dummy
   物理页、codec 抛错，一律 `DSV41LayerwiseC2Error`；不伪造命中、不跳过
   已跳过的 token。
 
-已知边界（t78 收口时）：t77 的 C2 codec/prefix 复用尚在并行开发中，
-本仓只能以契约一致的 fake codec 验证 capture→restore 往返与未命中
-fail-closed；真实 prefix 命中要等 t77 落地后由 t79 复审闭环。
+### 与真实 transport codec 的接线（t81）
+
+t77 把 C2 边界数据面做在 transport 侧（`lmcache_ascend/integration/vllm/
+dsv41_boundary_codec.py` 的 `encode_boundary_rows` / `decode_boundary_rows`
+＋ `DSV41LayerwiseMPWorkerAdapter` 内的 boundary pass），引擎侧只欠一份
+"这一步到底写了哪些行"的真实事实。t81 因此补的是 **provider**，不是第二个
+codec：
+
+- `provide_boundary_rows(resource_id, snapshot_id, boundary_token)`：
+  按资源返回 `(ring_cursor, compression_phase, row_indices)`；cursor =
+  `prefix_end % ring_rows`，phase = `prefix_end % ratio`，rows = 本步
+  state slot_mapping 命中本请求物理页的行（绝不 hash/modulo 猜）。资源
+  没有捕获、token 对不上、或本步没写行时返回 `None` —— snapshot 对该资源
+  保持 cold-only，不伪造。
+- `install_boundary_provider()`：在 `NPUModelRunner` 完成
+  `register_kv_caches` 之后调用一次。只有带
+  `worker_adapter.set_boundary_provider` 的 layerwise connector 才安装；
+  其它 connector（含 stock serving）是没有该方法的对象，本调用直接
+  no-op，行为零差异。
+- 捕获钩子现在由 `s1_capture_active()`（装了 push codec **或** provider）
+  驱动；push codec 路径（`set_boundary_state_codec`）保留，供需要引擎侧
+  直接搬字节的 transport 使用。
+- 镜像内自检 `image_self_check_t81.py`（挂载三仓，`--network none`）用真实
+  `lmcache` 协议与真实 codec 走通：provider → encode → descriptor 字段
+  （resource_id = `<execution_layer>.compressor.state_cache`、cursor、phase、
+  rows）→ 协议 checksum 复算一致 → decode → 换页 rebase 后逐字节相等 →
+  陈旧 token/无捕获保持 cold → restore 未命中 fail-closed。
+
+已知边界（t81 交 t82）：
+
+- transport 侧 restore 目前把 payload 写回**捕获时的行号**，且只复制本步
+  写入的行；plan §6 要求的是"整页复制 + rebase 到新请求自己的页"。跨请求
+  复用同一个 prefix 时两者不等价（会写到别的请求的页、ring 尾部留下旧
+  slot）。这是 transport 仓的改动，本仓只在 EVIDENCE-t81.md 记录为 finding。
+- `resource_id` 与 `execution_layer` 的映射是 `<execution_layer>` +
+  `.compressor.state_cache`，由 `vllm_impl.compressor_state_prefix` 提供，
+  不接受字符串改写推导。

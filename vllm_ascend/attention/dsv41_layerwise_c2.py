@@ -77,6 +77,7 @@ class DSV41BoundaryRequestView:
 
     layer_name: str
     execution_layer: str
+    resource_id: str
     request_id: str
     request_index: int
     step_id: int
@@ -100,6 +101,7 @@ class DSV41BoundaryTensorView:
 
     layer_name: str
     execution_layer: str
+    resource_id: str
     ring: torch.Tensor
     page_ids: torch.Tensor
     ring_rows: int
@@ -199,7 +201,26 @@ class _LayerRingState:
 #: "nothing to clear" apart from "the previous binding was None".
 NOT_BOUND = object()
 
+@dataclass(frozen=True)
+class _BoundaryRecord:
+    """Rows one layer wrote for one request, as handed to the transport."""
+
+    resource_id: str
+    request_id: str
+    step_id: int
+    prefix_end: int
+    end_token: int
+    ring_cursor: int
+    compression_phase: int
+    row_indices: tuple[int, ...]
+
+
 _codec: DSV41BoundaryStateCodec | None = None
+_provider_installed = False
+# Last capture per boundary-state resource, keyed by the resource id the
+# transport uses (the compressor state cache name). S0/S1 serve one request
+# per step, so the newest record is the boundary the step commits.
+_boundary_records: dict[str, _BoundaryRecord] = {}
 _step_view: DSV41StepRequestView | None = None
 _step_view_previous: list[DSV41StepRequestView | None] = []
 _next_step_id = 0
@@ -305,6 +326,7 @@ def reset_step_state() -> None:
     _next_step_id = 0
     _step_failures = 0
     _validated_step_id = None
+    _boundary_records.clear()
 
 
 def _tp_group() -> Any:
@@ -508,6 +530,7 @@ def _layer_ring_state(layer_name: str, attn: Any) -> _LayerRingState | None:
     tensor_view = DSV41BoundaryTensorView(
         layer_name=str(getattr(impl, "layer_name", layer_name)),
         execution_layer=str(getattr(attn, "layerwise_execution_layer", layer_name)),
+        resource_id=str(state_prefix),
         ring=ring,
         page_ids=block_table[:num_reqs, 0],
         ring_rows=ring_rows,
@@ -556,6 +579,7 @@ def _request_view(
     return DSV41BoundaryRequestView(
         layer_name=state.tensor_view.layer_name,
         execution_layer=state.tensor_view.execution_layer,
+        resource_id=state.tensor_view.resource_id,
         request_id=step_view.request_ids[request_index],
         request_index=request_index,
         step_id=step_view.step_id,
@@ -574,12 +598,121 @@ def _request_view(
     )
 
 
+def s1_capture_active() -> bool:
+    """True when this process must keep real boundary rows for S1."""
+    return _codec is not None or _provider_installed
+
+
+def _record_boundary(view: DSV41BoundaryRequestView) -> None:
+    _boundary_records[view.resource_id] = _BoundaryRecord(
+        resource_id=view.resource_id,
+        request_id=view.request_id,
+        step_id=view.step_id,
+        prefix_end=view.prefix_end,
+        end_token=view.prefix_end + view.step_tokens,
+        ring_cursor=view.prefix_end % view.ring_rows,
+        compression_phase=view.compression_phase,
+        row_indices=view.written_rows,
+    )
+
+
+def boundary_record(resource_id: str) -> _BoundaryRecord | None:
+    return _boundary_records.get(resource_id)
+
+
+def provide_boundary_rows(
+    resource_id: str,
+    snapshot_id: str,
+    boundary_token: Any,
+) -> tuple[int, int, tuple[int, ...]] | None:
+    """Hand the transport the real boundary rows of one resource (S1).
+
+    Installed as the layerwise worker adapter's boundary provider. Returns
+    ``(ring_cursor, compression_phase, row_indices)`` for the capture that
+    ends exactly at ``boundary_token``; anything else returns ``None`` so
+    the snapshot stays cold-only for that resource. Rows are never guessed:
+    they are the state slot-map rows this forward actually wrote.
+    """
+    record = _boundary_records.get(str(resource_id))
+    if record is None:
+        logger.warning(
+            "%s: no boundary capture for resource %s; leaving it cold-only",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    token = _token_int(boundary_token)
+    if token is None or token != record.end_token:
+        logger.warning(
+            "%s: boundary capture for %s ends at token %s but the transport "
+            "asked for %s; leaving it cold-only instead of fabricating rows",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+            record.end_token,
+            boundary_token,
+        )
+        return None
+    if not record.row_indices:
+        logger.warning(
+            "%s: boundary capture for %s wrote no rows this step; cold-only",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    return record.ring_cursor, record.compression_phase, record.row_indices
+
+
+def _token_int(boundary_token: Any) -> int | None:
+    try:
+        return int(str(boundary_token))
+    except (TypeError, ValueError):
+        return None
+
+
+def install_boundary_provider(connector: Any = None) -> bool:
+    """Install the engine boundary-row provider on the layerwise adapter.
+
+    Called once per worker after KV registration. Connectors that are not
+    the DSV4.1 layerwise transport simply do not expose
+    ``worker_adapter.set_boundary_provider``, so this is a no-op for every
+    other KV connector (stock serving included).
+    """
+    global _provider_installed
+    if connector is None:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return False
+        connector = get_kv_transfer_group()
+    worker = getattr(connector, "worker_adapter", None)
+    setter = getattr(worker, "set_boundary_provider", None)
+    if not callable(setter):
+        return False
+    setter(provide_boundary_rows)
+    _provider_installed = True
+    logger.info(
+        "%s: boundary provider installed on %s: S1 snapshots take the rows "
+        "this forward really wrote",
+        DSV41_LAYERWISE_C2_TAG,
+        type(worker).__name__,
+    )
+    return True
+
+
 def _run_hook(
     layer_name: str,
     attn: Any,
     codec_call: str,
 ) -> None:
-    if _codec is None:
+    if codec_call == "capture_layer_boundary":
+        # Capture also feeds the transport's boundary provider, so it runs
+        # whenever either the push codec or the provider is installed.
+        if not s1_capture_active():
+            return
+    elif _codec is None:
         return
     if init_phase_active():
         # Capture / profile forwards carry no scheduler step; dsa_v41_forward
@@ -597,6 +730,12 @@ def _run_hook(
     codec = _codec
     for request_index in range(state.num_reqs):
         request_view = _request_view(state, step_view, request_index)
+        if codec_call == "capture_layer_boundary":
+            # The provider always sees this step's rows, whether or not a
+            # push-mode codec is installed.
+            _record_boundary(request_view)
+        if codec is None:
+            continue
         try:
             getattr(codec, codec_call)(
                 request_view, state.tensor_view, stream=None
@@ -617,7 +756,9 @@ def restore_layer_boundary_state(layer_name: str, attn: Any) -> None:
 
 
 def capture_layer_boundary_state(layer_name: str, attn: Any) -> None:
-    """Hand this layer's freshly written ring page to the codec (S1)."""
+    """Record this layer's freshly written rows for S1 (codec and/or provider)."""
+    if not s1_capture_active():
+        return
     _run_hook(layer_name, attn, "capture_layer_boundary")
 
 
@@ -630,17 +771,21 @@ __all__ = [
     "admit_step",
     "bind_model_forward_step",
     "bind_step_request_view",
+    "NOT_BOUND",
+    "boundary_record",
     "boundary_state_codec",
     "boundary_state_codec_is_set",
     "capture_layer_boundary_state",
     "clear_boundary_state_codec",
     "clear_step_request_view",
     "current_step_request_view",
-    "NOT_BOUND",
+    "install_boundary_provider",
     "next_step_id",
     "note_step_failure",
+    "provide_boundary_rows",
     "reset_step_state",
     "restore_layer_boundary_state",
+    "s1_capture_active",
     "set_boundary_state_codec",
     "step_failure_count",
     "step_id_counter",
