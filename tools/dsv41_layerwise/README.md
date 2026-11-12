@@ -264,3 +264,50 @@ t87 的 `restore_target` 要求整步只有一个请求，多请求步一律回 
   后即可直接生效。该项属 transport 仓，见 EVIDENCE-t92.md 的 finding F3。
 - 多请求同 token 同页（例如两个请求恰好复用到同一物理页）在未点名时仍按
   歧义处理（`None`），由 transport 侧显式点名后再恢复。
+
+### 首 forward 的 S1 绑定竞态（t97）
+
+t96 的候选在**首个真实请求**就崩：`DSV41LayerwiseC2Error: ... reached the S1 C2
+hook without a bound step view`（16 个 worker 全崩）。根因是绑定条件与激活条件
+不一致，而不是 codec 真的没装：
+
+- `bind_model_forward_step` 早退看的是 `_codec is None`，但生产路径里
+  `set_boundary_state_codec` 没有调用者——S1 只靠 `install_boundary_provider`
+  装 provider。于是绑定永远返回 `NOT_BOUND`，而层钩子在 `s1_capture_active()`
+  （codec **或** provider）为真时就会要求 step view → 直接抛错。
+- 0.30 的异步调度让这件事更容易踩到：`has_sync_kv_loads` 为假时
+  `start_load_kv` 在 forward **之后**才跑，connector 的独立事件循环与首个
+  forward 并发。
+
+t97 的修法（仍只改本仓）：
+
+- 绑定条件改成 `not s1_capture_active()`：provider-only 也绑定；`admit_step`
+  内部仍只在 codec 安装时做 TP 门，provider-only 路径不新增 collective。
+- 新增激活代数 `_activation_generation` / `_bound_generation`：bind 时记账；
+  若某一步是在 S1 激活**之前**绑定的，层钩子只记一条 warning 并把该步当 cold
+  处理，不再让整组 worker 崩；真正的"从未绑定"仍然 fail-closed 抛错。
+- bind 时按请求记下 `(prefix_end, first_block)` 计划（`_request_pages`，取自
+  `input_batch.num_computed_tokens_cpu` 与 `block_table.block_tables[0]` 的
+  CPU 张量，不做 D2H）。`restore_target` 在拿不到 live metadata（forward 之后
+  的 `start_load_kv`）时回退到该计划，仍要求 `prefix_end == boundary_token`、
+  `page > 0`、几何已知，任何不符返回 `None`。
+- compressor-state 的写行改由 ring 语义直接给出：该 buffer 的 token slot 是
+  PAD（`dsa_v41.py` 的 "this buffer stays PAD"），真实写行等于 kernel 的
+  `tail_count = min(used, 32)`、`slot = (prefix_end + used - tail_count + i) % 32`
+  在请求自己页上的槽位。
+
+真机（c01，0.30.0rc2-a3，16 davinci）：37-token 单请求 200、输出 92 字符；
+512-token 连续 3 个请求 3/3 成功，`DSV41LayerwiseC2Error` = 0、
+`without a bound step view` = 0。8k 前缀请求仍会崩，但崩点已在 transport：
+`RuntimeError: recorded block groups (12) do not cover engine group 6 at
+index 12`（`dsv41_mp_adapter._blocks_for_engine_group`），见 EVIDENCE-t97.md
+的 finding F4/F5。
+
+已知边界（t97）：
+
+- boundary 捕获只存在于**真实 forward 的步终点**。若 transport 提交的 chunk
+  终点（如 512）不等于任何步终点（本步一次覆盖 644 个 token），引擎只会记一条
+  `... ends at token 644 but the transport asked for 512` 并让该 chunk 保持
+  cold（plan §6 的"无准确 C2 的 chunk 不 publish"），绝不拿后一步的 ring 冒充。
+- `restore_target` 的计划页只在"新请求正好在捕获边界续上"时成立；多请求步里
+  同 token 不同页仍按歧义 fail-closed。

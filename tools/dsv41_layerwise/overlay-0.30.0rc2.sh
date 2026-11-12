@@ -46,7 +46,11 @@ else
     [ -f "$VENDOR_SRC/op_api/lib/libcust_opapi.so" ] || die "镜像 vendor 库缺失: $VENDOR_SRC"
     mkdir -p "$BRANCH_DIR/vllm_ascend/_cann_ops_custom/vendors"
     cp -a "$VENDOR_SRC" "$VENDOR_DST"
-    nm -D "$VENDOR_DST/op_api/lib/libcust_opapi.so" | grep -q aclnnHcPre \
+    # Captured instead of piped into ``grep -q``: under ``set -o pipefail``
+    # grep exits at the first match, nm then dies of SIGPIPE and the pipeline
+    # reports failure on a library that is perfectly fine.
+    VENDOR_SYMBOLS="$(nm -D "$VENDOR_DST/op_api/lib/libcust_opapi.so" 2>/dev/null || true)"
+    grep -q aclnnHcPre <<< "$VENDOR_SYMBOLS" \
         || die "vendor 复制完成但 aclnnHcPre 符号校验失败"
     log "hc_pre 修复完成：vendor custom_transformer 已复制进分支树并校验 aclnnHcPre"
 fi

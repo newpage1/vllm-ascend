@@ -164,6 +164,11 @@ class DSV41StepRequestView:
     request_ids: tuple[str, ...]
     generation: int
     synthetic: bool = False
+    # ``(prefix_end, first_block)`` per request, in ``request_ids`` order. The
+    # scheduler owns these pages, and the transport loads a boundary after the
+    # forward (async KV load), when the step's ring metadata is already gone;
+    # this plan keeps the page each request owns addressable for that restore.
+    request_pages: tuple[tuple[int, int], ...] = ()
 
 
 @runtime_checkable
@@ -239,6 +244,20 @@ _step_view_previous: list[DSV41StepRequestView | None] = []
 _next_step_id = 0
 _step_failures = 0
 _validated_step_id: int | None = None
+# ``request_id -> (prefix_end, first_block)`` of the last bound real step. The
+# transport restores boundaries after the forward, so the live ring metadata of
+# that step is gone by then; the plan still names the page each request owns.
+_request_pages: dict[str, tuple[int, int]] = {}
+# Installs bump the activation generation. A forward that was bound before the
+# install cannot carry the step view the freshly activated path requires, so it
+# degrades to a cold step (once, with a warning) instead of failing every rank.
+_activation_generation = 0
+_bound_generation = -1
+# How many forwards were bound so far. A cold transition can only be claimed
+# when a forward really was bound before the install; an armed process that
+# never bound a step must still fail closed.
+_bind_count = 0
+_logged_transitions: set[str] = set()
 
 
 def boundary_state_codec() -> DSV41BoundaryStateCodec | None:
@@ -263,10 +282,12 @@ def set_boundary_state_codec(codec: DSV41BoundaryStateCodec) -> None:
             f"{type(codec).__name__}"
         )
     global _codec, _step_view, _step_failures, _validated_step_id
+    global _activation_generation
     _codec = codec
     _step_view = None
     _step_failures = 0
     _validated_step_id = None
+    _activation_generation += 1
     logger.info(
         "%s: boundary state codec bound (%s): S1 C2 capture/restore is ACTIVE",
         DSV41_LAYERWISE_C2_TAG,
@@ -300,10 +321,14 @@ def bind_step_request_view(
     view: DSV41StepRequestView,
 ) -> DSV41StepRequestView | None | object:
     """Bind the step a forward belongs to; returns the previous binding."""
-    global _step_view
+    global _step_view, _bound_generation, _bind_count
     previous = _step_view
     _step_view_previous.append(previous)
     _step_view = view
+    # A binding always knows which activation it was made under, so a step that
+    # started before an install is recognisable as a cold transition.
+    _bound_generation = _activation_generation
+    _bind_count += 1
     return previous
 
 
@@ -334,12 +359,19 @@ def step_id_counter() -> int:
 def reset_step_state() -> None:
     """Forget step bindings; used by tests and by connector teardown."""
     global _step_view, _next_step_id, _step_failures, _validated_step_id
+    global _bound_generation, _bind_count
     _step_view = None
     _step_view_previous.clear()
     _next_step_id = 0
     _step_failures = 0
     _validated_step_id = None
     _boundary_records.clear()
+    _request_pages.clear()
+    _logged_transitions.clear()
+    # Reset with the active generation so a test that installs a codec before
+    # its first forward does not look like a mid-flight transition.
+    _bound_generation = _activation_generation
+    _bind_count = 0
 
 
 def _tp_group() -> Any:
@@ -424,11 +456,18 @@ def bind_model_forward_step(
     Called by ``NPUModelRunner._model_forward`` right before the model runs,
     which is the one point every TP rank reaches with the step's input batch
     already prepared. Returns the previous binding for ``clear_step_request_view``.
+
+    Binding is armed by either half of S1 (a codec or the boundary provider):
+    the transport installs its provider at ``register_kv_caches`` time while a
+    codec may arrive later, so gating on the codec alone left the first real
+    forward unbound and failed every worker.
     """
-    if _codec is None:
+    if not s1_capture_active():
+        _note_unbound_step()
         return NOT_BOUND
     step_id = next_step_id()
     if init_phase_active() or decoder_replay_dummy:
+        _request_pages.clear()
         return bind_step_request_view(
             DSV41StepRequestView(
                 step_id=step_id,
@@ -439,10 +478,14 @@ def bind_model_forward_step(
         )
     input_batch = getattr(runner, "input_batch", None)
     req_ids = tuple(getattr(input_batch, "req_ids", ()) or ())
+    plan = _request_page_plan(runner, req_ids)
+    _request_pages.clear()
+    _request_pages.update({request_id: (end, page) for request_id, end, page in plan})
     view = DSV41StepRequestView(
         step_id=step_id,
         request_ids=req_ids,
         generation=_generation_of(runner),
+        request_pages=tuple((end, page) for _rid, end, page in plan),
     )
     previous = bind_step_request_view(view)
     try:
@@ -451,6 +494,53 @@ def bind_model_forward_step(
         note_step_failure("TP step gate rejected the batch")
         raise DSV41LayerwiseC2Error(str(exc)) from exc
     return previous
+
+
+def _note_unbound_step() -> None:
+    """Record that this forward ran before S1 was armed, for the transition rule."""
+    global _bound_generation, _bind_count
+    _bound_generation = _activation_generation
+    _bind_count += 1
+
+
+def _request_page_plan(
+    runner: Any, req_ids: tuple[str, ...]
+) -> tuple[tuple[str, int, int], ...]:
+    """``(request_id, prefix_end, first_block)`` for the step's requests.
+
+    ``prefix_end`` is the count of tokens computed before this step and the
+    first block is the request's ring page (the compressor kernel addresses a
+    request's ring through ``block_table[b, 0]``). Both live in the runner's
+    input batch at binding time; reading them here keeps the page addressable
+    after the forward, when the transport actually loads the boundary.
+    """
+    if not req_ids:
+        return ()
+    input_batch = getattr(runner, "input_batch", None)
+    if input_batch is None:
+        return ()
+    computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+    block_tables = getattr(input_batch, "block_table", None)
+    tables = getattr(block_tables, "block_tables", None)
+    first_group = tables[0] if tables else None
+    first_blocks = None
+    use_cpu_tensor = getattr(first_group, "get_cpu_tensor", None)
+    if callable(use_cpu_tensor):
+        first_blocks = use_cpu_tensor()
+    page_rows = int(getattr(first_blocks, "shape", (0, 0))[0]) if first_blocks is not None else 0
+    page_cols = int(getattr(first_blocks, "shape", (0, 0))[1]) if first_blocks is not None else 0
+    plan: list[tuple[str, int, int]] = []
+    for index, request_id in enumerate(req_ids):
+        prefix_end = 0
+        if computed is not None and index < len(computed):
+            prefix_end = int(computed[index])
+        page = 0
+        if first_blocks is not None and index < page_rows and page_cols > 0:
+            # The block table lives in host memory, so this read is not a
+            # device synchronisation on the forward path.
+            page = int(first_blocks[index, 0].item())
+        plan.append((str(request_id), prefix_end, page))
+    return tuple(plan)
 
 
 def _generation_of(runner: Any) -> int:
@@ -462,14 +552,29 @@ def _generation_of(runner: Any) -> int:
     return int(generation or 0)
 
 
-def _require_step_view(layer_name: str) -> DSV41StepRequestView:
+def _require_step_view(layer_name: str) -> DSV41StepRequestView | None:
     view = _step_view
-    if view is None:
-        raise DSV41LayerwiseC2Error(
-            f"layer {layer_name} reached the S1 C2 hook without a bound step "
-            "view; a real layerwise forward must be bound to its scheduler step"
-        )
-    return view
+    if view is not None:
+        return view
+    if _bind_count and _activation_generation != _bound_generation:
+        # S1 was armed after this forward was bound (the connector installs its
+        # provider from its own startup path, which can race the first real
+        # forward). This step cannot carry rows; serve it cold once instead of
+        # failing every worker, and say so.
+        if "transition" not in _logged_transitions:
+            _logged_transitions.add("transition")
+            logger.warning(
+                "%s: layer %s ran before S1 was armed (installed after this "
+                "step was bound); serving this step cold and capturing from "
+                "the next one",
+                DSV41_LAYERWISE_C2_TAG,
+                layer_name,
+            )
+        return None
+    raise DSV41LayerwiseC2Error(
+        f"layer {layer_name} reached the S1 C2 hook without a bound step "
+        "view; a real layerwise forward must be bound to its scheduler step"
+    )
 
 
 def _layer_ring_state(layer_name: str, attn: Any) -> _LayerRingState | None:
@@ -575,20 +680,36 @@ def _request_view(
     ring_metadata = state.metadata.c2_ring_metadata
     control = tuple(int(v) for v in ring_metadata[:, request_index].tolist())
     prefix_end, used, _out_base, _in_base, page = control
-    slot_mapping = getattr(state.metadata, "slot_mapping", None)
-    if slot_mapping is None:
-        raise DSV41LayerwiseC2Error(
-            f"layer {state.tensor_view.layer_name} has no state slot mapping; "
-            "boundary rows cannot be proven to have been written"
-        )
-    rows = slot_mapping[(slot_mapping // state.tensor_view.ring_rows) == page]
-    if rows.numel() == 0 and used > 0:
-        raise DSV41LayerwiseC2Error(
-            f"layer {state.tensor_view.layer_name} wrote {used} token(s) for "
-            f"request {step_view.request_ids[request_index]!r} but no state row "
-            f"belongs to page {page}"
-        )
     ring_rows = state.tensor_view.ring_rows
+    if getattr(state.metadata, "is_compressor_state", False):
+        # A compressor-state buffer is addressed by its ring alone: its token
+        # slot buffer intentionally stays PAD (see ``_build_metadata``), so the
+        # rows this step wrote are exactly the ring slots the update kernel
+        # computes: the kernel keeps the *last* ``min(used, ring_rows)`` tokens
+        # of the step (``token_in_seg = used - tail_count + write_idx``) and
+        # writes ``slot = (prefix_end + token_in_seg) % ring_rows`` on the
+        # request's own page (``c2_ring_metadata`` row 4).
+        tail_count = min(max(int(used), 0), ring_rows)
+        first_token = int(prefix_end) + max(int(used), 0) - tail_count
+        rows = tuple(
+            int(page) * ring_rows + (first_token + index) % ring_rows
+            for index in range(tail_count)
+        )
+    else:
+        slot_mapping = getattr(state.metadata, "slot_mapping", None)
+        if slot_mapping is None:
+            raise DSV41LayerwiseC2Error(
+                f"layer {state.tensor_view.layer_name} has no state slot mapping; "
+                "boundary rows cannot be proven to have been written"
+            )
+        matched = slot_mapping[(slot_mapping // ring_rows) == page]
+        rows = tuple(int(v) for v in matched.tolist())
+        if not rows and used > 0:
+            raise DSV41LayerwiseC2Error(
+                f"layer {state.tensor_view.layer_name} wrote {used} token(s) for "
+                f"request {step_view.request_ids[request_index]!r} but no state row "
+                f"belongs to page {page}"
+            )
     return DSV41BoundaryRequestView(
         layer_name=state.tensor_view.layer_name,
         execution_layer=state.tensor_view.execution_layer,
@@ -607,7 +728,7 @@ def _request_view(
         compression_ratio=state.ratio,
         compression_phase=int(prefix_end) % state.ratio,
         position_control=control,
-        written_rows=tuple(int(v) for v in rows.tolist()),
+        written_rows=rows,
     )
 
 
@@ -840,6 +961,82 @@ def _live_ring_metadata(resource_id: str) -> torch.Tensor | None:
     return ring_metadata
 
 
+_NO_PLAN = object()
+
+
+def _planned_target(
+    resource_id: str, token: int, request_id: str | None
+) -> tuple[int, int] | None | object:
+    """Resolve a target page from the bound step's own page plan.
+
+    The transport loads a boundary after the forward that produced the step,
+    when the live ring metadata is gone but the pages the scheduler allocated
+    are still exactly the ones the plan recorded. ``_NO_PLAN`` means this
+    step's plan cannot answer (the caller may still try live metadata);
+    ``None`` means the plan knows the request but refuses the page.
+    """
+    if request_id is not None:
+        plan = _request_pages.get(str(request_id))
+        if plan is None:
+            return _NO_PLAN
+        return _planned_page(resource_id, token, str(request_id), plan[0], plan[1])
+    if not _request_pages:
+        return _NO_PLAN
+    matches = [
+        (rid, end, page)
+        for rid, (end, page) in _request_pages.items()
+        if end == token
+    ]
+    pages = {page for _rid, _end, page in matches}
+    if not pages:
+        return _NO_PLAN
+    if len(pages) > 1:
+        logger.warning(
+            "%s: %d requests resume at token %d with different planned pages "
+            "and no request id names one; staying fail-closed for this "
+            "boundary instead of guessing a page",
+            DSV41_LAYERWISE_C2_TAG,
+            len(matches),
+            token,
+        )
+        return None
+    rid, end, page = matches[0]
+    return _planned_page(resource_id, token, rid, end, page)
+
+
+def _planned_page(
+    resource_id: str, token: int, request_id: str, prefix_end: int, page: int
+) -> tuple[int, int] | None:
+    if prefix_end != token:
+        logger.warning(
+            "%s: request %r resumes at token %d but the snapshot ends at %d; "
+            "the planned page does not apply, staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            request_id,
+            prefix_end,
+            token,
+        )
+        return None
+    if page <= 0:
+        logger.warning(
+            "%s: request %r has no ring page allocated for the step ending at "
+            "token %d; staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            request_id,
+            token,
+        )
+        return None
+    rows = _ring_rows_known(resource_id)
+    if rows is None:
+        logger.warning(
+            "%s: no ring geometry is known for %s; staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    return page, rows
+
+
 def restore_target(
     resource_id: str,
     boundary_token: Any,
@@ -865,6 +1062,12 @@ def restore_target(
     """
     if not _provider_installed:
         return None
+    token = _token_int(boundary_token)
+    if token is None:
+        return None
+    planned = _planned_target(resource_id, token, request_id)
+    if planned is not _NO_PLAN:
+        return planned
     view = _step_view
     if view is None:
         logger.warning(
@@ -875,9 +1078,6 @@ def restore_target(
         )
         return None
     if view.synthetic:
-        return None
-    token = _token_int(boundary_token)
-    if token is None:
         return None
     ring_metadata = _live_ring_metadata(resource_id)
     if ring_metadata is None:
@@ -1043,7 +1243,7 @@ def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
     ring geometry is bound and the adapter's boundary caches are pointed at
     absolute-row views of the same storage.
     """
-    global _provider_installed
+    global _provider_installed, _activation_generation
     if connector is None:
         from vllm.distributed.kv_transfer import (
             get_kv_transfer_group,
@@ -1064,6 +1264,7 @@ def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
         bind_ring_geometry(model)
     swapped = use_row_space_views(worker)
     _provider_installed = True
+    _activation_generation += 1
     logger.info(
         "%s: boundary provider installed on %s: S1 snapshots take the rows "
         "this forward really wrote (%d boundary cache(s) on an absolute-row "
@@ -1093,6 +1294,9 @@ def _run_hook(
         # already bypassed admission for them. Never manufacture a boundary.
         return
     step_view = _require_step_view(layer_name)
+    if step_view is None:
+        # This forward was bound before S1 was armed: serve the step cold.
+        return
     if step_view.synthetic:
         # Decoder-replay dummies replay a captured plan: they carry no
         # scheduler step and must not publish or consume a boundary.
