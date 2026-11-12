@@ -263,6 +263,89 @@ def _capture(c2: types.ModuleType, attn: _Attn, meta: _Meta, *, token: str) -> N
     assert str(record.end_token) == token
 
 
+class _MultiMeta:
+    """Stand-in for a ratio-2 layer's metadata in a multi-request step."""
+
+    def __init__(
+        self,
+        prefix_ends: list[int],
+        used: list[int],
+        pages: list[int],
+    ) -> None:
+        count = len(pages)
+        assert len(prefix_ends) == count and len(used) == count
+        control = torch.zeros(5, count, dtype=torch.int32)
+        control[0, :] = torch.tensor(prefix_ends, dtype=torch.int32)
+        control[1, :] = torch.tensor(used, dtype=torch.int32)
+        control[4, :] = torch.tensor(pages, dtype=torch.int32)
+        self.c2_ring_metadata = control
+        self.block_table = torch.tensor([[page] for page in pages], dtype=torch.int64)
+        self.num_reqs = count
+        self.compress_ratio = 2
+        self.max_query_len = max(used) if used else 0
+        self.slot_mapping = torch.tensor(
+            [
+                page * RING_ROWS + (prefix_end + step) % RING_ROWS
+                for prefix_end, page, written in zip(prefix_ends, pages, used)
+                for step in range(max(written, 0))
+            ],
+            dtype=torch.int64,
+        )
+
+
+def _bind_multi_step(
+    c2: types.ModuleType,
+    request_ids: tuple[str, ...],
+    step_id: int,
+) -> None:
+    c2.bind_step_request_view(
+        c2.DSV41StepRequestView(
+            step_id=step_id,
+            request_ids=request_ids,
+            generation=0,
+            synthetic=False,
+        )
+    )
+
+
+def _capture_multi(
+    c2: types.ModuleType,
+    attn: _Attn,
+    meta: _MultiMeta,
+    request_ids: tuple[str, ...],
+    step_id: int = 3,
+) -> None:
+    c2._test_context["attn_metadata"] = {STATE_PREFIX: meta}
+    _bind_multi_step(c2, request_ids, step_id)
+    c2.capture_layer_boundary_state(
+        "language_model.model.layers.0.self_attn.v41_attn", attn
+    )
+
+
+def _frame(
+    codec: types.ModuleType,
+    worker: _Worker,
+    c2: types.ModuleType,
+    token: str,
+    request_id: str | None = None,
+):
+    provided = c2.provide_boundary_rows(
+        STATE_PREFIX, "snap-multi", token, request_id=request_id
+    )
+    assert provided is not None, f"no boundary rows for token {token!r}"
+    cursor, phase, rows = provided
+    return codec.encode_boundary_rows(
+        _row_space(worker),
+        list(rows),
+        snapshot_id="snap-multi",
+        resource_id=STATE_PREFIX,
+        boundary_token=token,
+        ring_cursor=cursor,
+        compression_phase=phase,
+        ring_length=c2.ring_rows(STATE_PREFIX),
+    )
+
+
 def _row_space(worker: _Worker) -> torch.Tensor:
     cache = worker.kv_caches[STATE_PREFIX]
     assert isinstance(cache, torch.Tensor)
@@ -364,8 +447,9 @@ def test_restore_target_rebases_the_page_and_leaves_no_stale_tail(transport, c2)
     )
 
     # The new request resumes exactly at token 73 and owns page 4, whose slots
-    # still hold this worker's previous traffic.
-    target_meta = _Meta(prefix_end=73, used=0, page=4)
+    # still hold this worker's previous traffic. It carries its own tokens:
+    # the kernel writes the page only when ``used > 0`` (see npu_check_t92.py).
+    target_meta = _Meta(prefix_end=73, used=3, page=4)
     c2._test_context["attn_metadata"] = {STATE_PREFIX: target_meta}
     _bind_step(c2, "req-b", 4)
     target = c2.restore_target(STATE_PREFIX, "73")
@@ -391,12 +475,16 @@ def test_restore_target_fails_closed_on_every_mismatch(c2) -> None:
     _bind_step(c2, "req-b", 4)
     assert c2.restore_target(STATE_PREFIX, "73") is None
 
-    # Two requests in one step: a boundary page belongs to exactly one.
+    # Two requests of one step resume at the same token on different pages:
+    # neither can claim the snapshot unless a request id names one.
     c2.bind_step_request_view(
         c2.DSV41StepRequestView(step_id=5, request_ids=("req-b", "req-c"), generation=0, synthetic=False)
     )
-    c2._test_context["attn_metadata"] = {STATE_PREFIX: _Meta(prefix_end=73, used=0, page=4)}
+    c2._test_context["attn_metadata"] = {
+        STATE_PREFIX: _MultiMeta([73, 73], [3, 3], [4, 5])
+    }
     assert c2.restore_target(STATE_PREFIX, "73") is None
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-c") == (5, RING_ROWS)
 
     # Synthetic (capture/profile/dummy) forwards never own a page.
     _bind_step(c2, "req-b", 6, synthetic=True)
@@ -413,9 +501,26 @@ def test_restore_target_fails_closed_on_every_mismatch(c2) -> None:
 
     # A provider that was never installed answers nothing.
     c2._provider_installed = False
-    c2._test_context["attn_metadata"] = {STATE_PREFIX: _Meta(prefix_end=73, used=0, page=4)}
+    c2._test_context["attn_metadata"] = {STATE_PREFIX: _Meta(prefix_end=73, used=3, page=4)}
     _bind_step(c2, "req-b", 8)
     assert c2.restore_target(STATE_PREFIX, "73") is None
+
+
+def test_a_request_without_tokens_cannot_name_a_page(c2) -> None:
+    """The kernel leaves the page unset when the request has no tokens.
+
+    On device (``npu_check_t92.py``) a step whose requests carry ``used == 0``
+    produces ``c2_ring_metadata[4] == 0``: the page is not written at all. Such
+    a row must never be read as page 0.
+    """
+    attn = _Attn()
+    _install(c2, attn)
+    _capture(c2, attn, _Meta(prefix_end=70, used=3, page=2), token="73")
+
+    _bind_step(c2, "req-b", 9)
+    c2._test_context["attn_metadata"] = {STATE_PREFIX: _Meta(prefix_end=73, used=0, page=0)}
+    assert c2.restore_target(STATE_PREFIX, "73") is None
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-b") is None
 
 
 def test_without_the_hooks_the_whole_page_contract_is_impossible(transport, c2) -> None:
@@ -449,3 +554,158 @@ def test_without_the_hooks_the_whole_page_contract_is_impossible(transport, c2) 
     )
     assert descriptor.schema_version == 1
     assert len(descriptor.row_indices) == 1
+
+
+def test_two_requests_store_their_own_pages_without_overwriting(transport, c2) -> None:
+    """One step, two requests: each keeps its own page and rows (t92)."""
+    _protocol, codec = transport
+    attn = _Attn()
+    worker, _connector = _install(c2, attn)
+    ring = attn.compressor.state_cache.kv_cache[0]
+    ring[2, 6:9, 0, :] = torch.arange(2 * HEAD_DIM) + 100
+    ring[3, 7:10, 0, :] = torch.arange(2 * HEAD_DIM) + 200
+    _capture_multi(c2, attn, _MultiMeta([70, 71], [3, 3], [2, 3]), ("req-a", "req-b"))
+
+    first = c2.boundary_record(STATE_PREFIX, request_id="req-a")
+    second = c2.boundary_record(STATE_PREFIX, request_id="req-b")
+    assert first is not None and second is not None
+    assert (first.request_id, first.end_token, first.ring_cursor) == ("req-a", 73, 70 % RING_ROWS)
+    assert (second.request_id, second.end_token, second.ring_cursor) == ("req-b", 74, 71 % RING_ROWS)
+    assert first.row_indices == tuple(2 * RING_ROWS + slot for slot in range(6, 9))
+    assert second.row_indices == tuple(3 * RING_ROWS + slot for slot in range(7, 10))
+    # The newest record is still reachable without a request id, but it never
+    # replaced the other request's capture.
+    assert c2.boundary_record(STATE_PREFIX) is second
+
+    descriptor_a, payload_a = _frame(codec, worker, c2, "73")
+    descriptor_b, payload_b = _frame(codec, worker, c2, "74")
+    assert descriptor_a.row_indices[0] == 2 * RING_ROWS
+    assert descriptor_b.row_indices[0] == 3 * RING_ROWS
+    page_a = codec.decode_boundary_rows(payload_a)["rows"]
+    page_b = codec.decode_boundary_rows(payload_b)["rows"]
+    assert torch.equal(page_a[6:9], ring[2, 6:9, 0, :])
+    assert torch.equal(page_b[7:10], ring[3, 7:10, 0, :])
+    assert torch.count_nonzero(page_a[:6]) == 0
+    assert torch.count_nonzero(page_b[:7]) == 0
+
+
+def test_same_prefix_requests_stay_apart_or_fail_closed(transport, c2) -> None:
+    """Same boundary token, different pages: ambiguity is refused, not guessed."""
+    _protocol, codec = transport
+    attn = _Attn()
+    worker, _connector = _install(c2, attn)
+    ring = attn.compressor.state_cache.kv_cache[0]
+    ring[4, 8:10, 0, :] = torch.arange(2 * HEAD_DIM) + 400
+    ring[5, 8:10, 0, :] = torch.arange(2 * HEAD_DIM) + 500
+    _capture_multi(c2, attn, _MultiMeta([72, 72], [2, 2], [4, 5]), ("req-a", "req-b"))
+
+    # The transport only has the token here, and both requests end at it.
+    assert c2.provide_boundary_rows(STATE_PREFIX, "snap", "74") is None
+    # Naming the request resolves it exactly.
+    assert c2.provide_boundary_rows(
+        STATE_PREFIX, "snap", "74", request_id="req-b"
+    ) == (72 % RING_ROWS, 0, (5 * RING_ROWS + 8, 5 * RING_ROWS + 9))
+    assert c2.provide_boundary_rows(
+        STATE_PREFIX, "snap", "74", request_id="req-a"
+    ) == (72 % RING_ROWS, 0, (4 * RING_ROWS + 8, 4 * RING_ROWS + 9))
+
+    descriptor_a, _payload_a = _frame(codec, worker, c2, "74", request_id="req-a")
+    descriptor_b, _payload_b = _frame(codec, worker, c2, "74", request_id="req-b")
+    assert descriptor_a.row_indices[0] == 4 * RING_ROWS
+    assert descriptor_b.row_indices[0] == 5 * RING_ROWS
+
+
+def test_restore_target_names_each_request_its_own_page(c2) -> None:
+    attn = _Attn()
+    _install(c2, attn)
+    c2._test_context["attn_metadata"] = {
+        STATE_PREFIX: _MultiMeta([73, 74], [3, 3], [4, 5])
+    }
+    _bind_multi_step(c2, ("req-x", "req-y"), 9)
+
+    # Without ids the token still selects the resuming request.
+    assert c2.restore_target(STATE_PREFIX, "73") == (4, RING_ROWS)
+    assert c2.restore_target(STATE_PREFIX, "74") == (5, RING_ROWS)
+    # A named request is resolved from its own row.
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-x") == (4, RING_ROWS)
+    # A request that does not resume at that boundary never borrows the page.
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-y") is None
+    # A request outside this step never borrows another request's page.
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-z") is None
+
+
+def test_one_unattributable_request_does_not_sink_the_batch(c2) -> None:
+    attn = _Attn()
+    _install(c2, attn)
+    # The second request resumes elsewhere; the first one still restores.
+    c2._test_context["attn_metadata"] = {
+        STATE_PREFIX: _MultiMeta([73, 91], [3, 3], [4, 5])
+    }
+    _bind_multi_step(c2, ("req-a", "req-b"), 10)
+    assert c2.restore_target(STATE_PREFIX, "73") == (4, RING_ROWS)
+    assert c2.restore_target(STATE_PREFIX, "92") is None
+
+    # Two requests claim the same token on different pages: the unnamed call
+    # stays cold, each named call keeps its own page, and neither takes the
+    # other's page.
+    c2._test_context["attn_metadata"] = {
+        STATE_PREFIX: _MultiMeta([73, 73], [3, 3], [4, 5])
+    }
+    _bind_multi_step(c2, ("req-a", "req-b"), 11)
+    assert c2.restore_target(STATE_PREFIX, "73") is None
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-a") == (4, RING_ROWS)
+    assert c2.restore_target(STATE_PREFIX, "73", request_id="req-b") == (5, RING_ROWS)
+
+
+@pytest.mark.parametrize("batch", [2, 4, 8])
+def test_concurrent_requests_keep_isolated_boundaries(transport, c2, batch) -> None:
+    """2/4/8 requests in one step: every boundary stays on its own page."""
+    _protocol, codec = transport
+    attn = _Attn()
+    attn.compressor.state_cache.kv_cache[0] = torch.zeros(
+        16, RING_ROWS, 1, 2 * HEAD_DIM, dtype=torch.float32
+    )
+    worker, _connector = _install(c2, attn)
+    ring = attn.compressor.state_cache.kv_cache[0]
+    prefix_ends = [64 + 3 * index for index in range(batch)]
+    pages = [2 + index for index in range(batch)]
+    slots = [prefix_end % RING_ROWS for prefix_end in prefix_ends]
+    assert len(set(slots)) == batch
+    for index, (page, slot) in enumerate(zip(pages, slots)):
+        ring[page, slot, 0, :] = torch.arange(2 * HEAD_DIM) + 1000 + index
+    request_ids = tuple(f"req-{index}" for index in range(batch))
+    _capture_multi(
+        c2, attn, _MultiMeta(prefix_ends, [1] * batch, pages), request_ids
+    )
+
+    descriptors = []
+    for index, (prefix_end, page, slot) in enumerate(zip(prefix_ends, pages, slots)):
+        record = c2.boundary_record(STATE_PREFIX, request_id=request_ids[index])
+        assert record is not None
+        assert (record.prefix_end, record.end_token) == (prefix_end, prefix_end + 1)
+        assert record.row_indices == (page * RING_ROWS + slot,)
+        descriptor, payload = _frame(codec, worker, c2, str(prefix_end + 1))
+        assert descriptor.row_indices[0] == page * RING_ROWS
+        page_bytes = codec.decode_boundary_rows(payload)["rows"]
+        assert torch.equal(page_bytes[slot], ring[page, slot, 0, :])
+        others = torch.cat([page_bytes[:slot], page_bytes[slot + 1 :]])
+        assert torch.count_nonzero(others) == 0
+        descriptors.append(descriptor)
+
+    for first in range(batch):
+        for second in range(first + 1, batch):
+            assert set(descriptors[first].row_indices).isdisjoint(
+                descriptors[second].row_indices
+            )
+
+    # Every request of the restore step keeps its own page, by id and by token.
+    c2._test_context["attn_metadata"] = {
+        STATE_PREFIX: _MultiMeta(prefix_ends, [3] * batch, pages)
+    }
+    _bind_multi_step(c2, request_ids, 12)
+    for index, (prefix_end, page) in enumerate(zip(prefix_ends, pages)):
+        assert c2.restore_target(
+            STATE_PREFIX, str(prefix_end), request_id=request_ids[index]
+        ) == (page, RING_ROWS)
+    for prefix_end, page in zip(prefix_ends, pages):
+        assert c2.restore_target(STATE_PREFIX, str(prefix_end)) == (page, RING_ROWS)

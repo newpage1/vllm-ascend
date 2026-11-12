@@ -222,10 +222,14 @@ class _BoundaryRecord:
 
 _codec: DSV41BoundaryStateCodec | None = None
 _provider_installed = False
-# Last capture per boundary-state resource, keyed by the resource id the
-# transport uses (the compressor state cache name). S0/S1 serve one request
-# per step, so the newest record is the boundary the step commits.
-_boundary_records: dict[str, _BoundaryRecord] = {}
+# Captures keyed by ``(step_id, request_id, resource_id)``: a step may carry
+# several requests, each owning its own ring page, so one request's capture
+# must never overwrite another's. The transport identifies a boundary by the
+# token it ends at; request ids are the stronger key when a caller has one.
+_boundary_records: dict[tuple[int, str, str], _BoundaryRecord] = {}
+# Bound so a long serving run cannot grow the capture map without limit.
+# Only recent steps matter: a snapshot is stored right after its forward.
+_BOUNDARY_RECORD_LIMIT = 4096
 # Rows per page of every ratio-2 compressor ring, bound once from the model
 # at install time. The transport frames whole pages by this geometry, so it
 # must come from the real cache and never from a constant guess.
@@ -613,7 +617,7 @@ def s1_capture_active() -> bool:
 
 
 def _record_boundary(view: DSV41BoundaryRequestView) -> None:
-    _boundary_records[view.resource_id] = _BoundaryRecord(
+    record = _BoundaryRecord(
         resource_id=view.resource_id,
         request_id=view.request_id,
         step_id=view.step_id,
@@ -623,44 +627,119 @@ def _record_boundary(view: DSV41BoundaryRequestView) -> None:
         compression_phase=view.compression_phase,
         row_indices=view.written_rows,
     )
+    _boundary_records[(view.step_id, view.request_id, view.resource_id)] = record
+    while len(_boundary_records) > _BOUNDARY_RECORD_LIMIT:
+        oldest = next(iter(_boundary_records))
+        del _boundary_records[oldest]
 
 
-def boundary_record(resource_id: str) -> _BoundaryRecord | None:
-    return _boundary_records.get(resource_id)
+def boundary_record(
+    resource_id: str,
+    request_id: str | None = None,
+    step_id: int | None = None,
+) -> _BoundaryRecord | None:
+    """Newest capture of ``resource_id``, optionally for one request/step."""
+    newest: _BoundaryRecord | None = None
+    for record in _boundary_records.values():
+        if record.resource_id != resource_id:
+            continue
+        if request_id is not None and record.request_id != request_id:
+            continue
+        if step_id is not None and record.step_id != step_id:
+            continue
+        newest = record
+    return newest
+
+
+def _matching_records(
+    resource_id: str,
+    boundary_token: int,
+    request_id: str | None,
+) -> list[_BoundaryRecord]:
+    matched: list[_BoundaryRecord] = []
+    for record in _boundary_records.values():
+        if record.resource_id != resource_id:
+            continue
+        if request_id is not None and record.request_id != request_id:
+            continue
+        if record.end_token == boundary_token:
+            matched.append(record)
+    return matched
 
 
 def provide_boundary_rows(
     resource_id: str,
     snapshot_id: str,
     boundary_token: Any,
+    request_id: str | None = None,
 ) -> tuple[int, int, tuple[int, ...]] | None:
-    """Hand the transport the real boundary rows of one resource (S1).
+    """Hand the transport the real boundary rows of one request (S1).
 
     Installed as the layerwise worker adapter's boundary provider. Returns
     ``(ring_cursor, compression_phase, row_indices)`` for the capture that
     ends exactly at ``boundary_token``; anything else returns ``None`` so
-    the snapshot stays cold-only for that resource. Rows are never guessed:
+    the snapshot stays cold-only for that request. Rows are never guessed:
     they are the state slot-map rows this forward actually wrote.
+
+    A step may carry several requests, each with its own capture. The
+    boundary token normally separates them; when two requests of the same
+    step end at the same token their captures can still disagree on the
+    physical page, and that ambiguity is refused (cold-only) rather than
+    resolved by guessing. Passing ``request_id`` names the request outright
+    and removes the ambiguity.
     """
-    record = _boundary_records.get(str(resource_id))
-    if record is None:
-        logger.warning(
-            "%s: no boundary capture for resource %s; leaving it cold-only",
-            DSV41_LAYERWISE_C2_TAG,
-            resource_id,
-        )
-        return None
     token = _token_int(boundary_token)
-    if token is None or token != record.end_token:
+    if token is None:
         logger.warning(
-            "%s: boundary capture for %s ends at token %s but the transport "
-            "asked for %s; leaving it cold-only instead of fabricating rows",
+            "%s: boundary token %r is not an integer; leaving %s cold-only",
             DSV41_LAYERWISE_C2_TAG,
-            resource_id,
-            record.end_token,
             boundary_token,
+            resource_id,
         )
         return None
+    matched = _matching_records(str(resource_id), token, request_id)
+    if not matched:
+        known = [
+            record
+            for record in _boundary_records.values()
+            if record.resource_id == str(resource_id)
+        ]
+        if known:
+            logger.warning(
+                "%s: boundary capture for %s ends at token %s but the "
+                "transport asked for %s%s; leaving it cold-only instead of "
+                "fabricating rows",
+                DSV41_LAYERWISE_C2_TAG,
+                resource_id,
+                known[-1].end_token,
+                boundary_token,
+                f" (request {request_id!r})" if request_id is not None else "",
+            )
+        else:
+            logger.warning(
+                "%s: no boundary capture for resource %s ending at token %d; "
+                "leaving it cold-only",
+                DSV41_LAYERWISE_C2_TAG,
+                resource_id,
+                token,
+            )
+        return None
+    distinct = {
+        (record.ring_cursor, record.compression_phase, record.row_indices)
+        for record in matched
+    }
+    if len(distinct) > 1:
+        logger.warning(
+            "%s: %d captures of %s end at token %d with different pages/rows "
+            "and no request id names one; leaving it cold-only instead of "
+            "guessing a page",
+            DSV41_LAYERWISE_C2_TAG,
+            len(matched),
+            resource_id,
+            token,
+        )
+        return None
+    record = matched[-1]
     if not record.row_indices:
         logger.warning(
             "%s: boundary capture for %s wrote no rows this step; cold-only",
@@ -764,15 +843,25 @@ def _live_ring_metadata(resource_id: str) -> torch.Tensor | None:
 def restore_target(
     resource_id: str,
     boundary_token: Any,
+    request_id: str | None = None,
 ) -> tuple[int, int] | None:
-    """Name the new request's own ring page for a whole-page restore (S1).
+    """Name the restoring request's own ring page for a whole-page restore (S1).
 
     Installed as an attribute of :func:`provide_boundary_rows`; the transport
-    calls it before it rebases a captured page onto the live request. Only a
-    forward that resumes exactly at the captured boundary qualifies: one real
-    request, ``prefix_end == boundary_token`` and a physical page taken from
-    that request's own ring metadata. Anything else returns ``None`` so the
-    transport stays fail-closed instead of writing a page nobody reads.
+    calls it before it rebases a captured page onto the live request. Every
+    request carries its own control row in the live ``c2_ring_metadata`` and
+    its own ``block_table[:, 0]`` page, so the target page is resolved per
+    request rather than by requiring a one-request step:
+
+    * with ``request_id`` the request is named outright and must resume
+      exactly at ``boundary_token``;
+    * without it, exactly one request of the step may resume at that token.
+      Two requests resuming at the same token with different pages are
+      ambiguous, and ambiguity is refused for that request only — the other
+      requests of the batch keep their own restores.
+
+    Anything unresolved returns ``None`` so the transport stays fail-closed
+    instead of writing a page nobody reads.
     """
     if not _provider_installed:
         return None
@@ -787,16 +876,6 @@ def restore_target(
         return None
     if view.synthetic:
         return None
-    if len(view.request_ids) != 1:
-        logger.warning(
-            "%s: restore target asked for %s with %d requests in the step; "
-            "a boundary page belongs to exactly one request, staying "
-            "fail-closed",
-            DSV41_LAYERWISE_C2_TAG,
-            resource_id,
-            len(view.request_ids),
-        )
-        return None
     token = _token_int(boundary_token)
     if token is None:
         return None
@@ -809,17 +888,80 @@ def restore_target(
             resource_id,
         )
         return None
-    prefix_end = int(ring_metadata[0, 0])
-    if prefix_end != token:
+    rows_in_step = min(int(ring_metadata.shape[1]), len(view.request_ids))
+    if rows_in_step <= 0:
+        return None
+    if request_id is not None:
+        try:
+            index = view.request_ids.index(request_id)
+        except ValueError:
+            logger.warning(
+                "%s: restore target asked for %s of request %r, which is not "
+                "in this step; staying fail-closed",
+                DSV41_LAYERWISE_C2_TAG,
+                resource_id,
+                request_id,
+            )
+            return None
+        if index >= rows_in_step:
+            return None
+        candidates = [index]
+    else:
+        candidates = [
+            index
+            for index in range(rows_in_step)
+            if int(ring_metadata[0, index]) == token
+        ]
+        if not candidates:
+            logger.warning(
+                "%s: %s resumes at no request of this step at token %d; the "
+                "boundary does not apply, staying fail-closed",
+                DSV41_LAYERWISE_C2_TAG,
+                resource_id,
+                token,
+            )
+            return None
+    # A request that carries no token of its own in this step leaves its
+    # control row unset (the kernel keeps the page only when ``used > 0``),
+    # so its row cannot name a page even though its prefix end matches.
+    silent = [
+        index for index in candidates if int(ring_metadata[1, index]) <= 0
+    ]
+    if silent:
         logger.warning(
-            "%s: %s resumes at token %d but the snapshot ends at %d; the "
-            "boundary does not apply, staying fail-closed",
+            "%s: request(s) %s resume at token %d without a token of their "
+            "own this step, so the kernel left their page unset; staying "
+            "fail-closed for this boundary",
             DSV41_LAYERWISE_C2_TAG,
-            resource_id,
-            prefix_end,
+            [view.request_ids[index] for index in silent],
+            token,
+        )
+        candidates = [index for index in candidates if index not in silent]
+        if not candidates:
+            return None
+    pages = {int(ring_metadata[4, index]) for index in candidates}
+    if len(pages) > 1:
+        logger.warning(
+            "%s: %d requests of this step resume at token %d with different "
+            "pages and no request id names one; staying fail-closed for this "
+            "boundary instead of guessing a page",
+            DSV41_LAYERWISE_C2_TAG,
+            len(candidates),
             token,
         )
         return None
+    for index in candidates:
+        prefix_end = int(ring_metadata[0, index])
+        if prefix_end != token:
+            logger.warning(
+                "%s: request %r resumes at token %d but the snapshot ends at "
+                "%d; the boundary does not apply, staying fail-closed",
+                DSV41_LAYERWISE_C2_TAG,
+                view.request_ids[index],
+                prefix_end,
+                token,
+            )
+            return None
     rows = _ring_rows_known(resource_id)
     if rows is None:
         logger.warning(
@@ -829,7 +971,7 @@ def restore_target(
             resource_id,
         )
         return None
-    return int(ring_metadata[4, 0]), rows
+    return int(ring_metadata[4, candidates[0]]), rows
 
 
 def row_space_view(value: Any) -> torch.Tensor | None:

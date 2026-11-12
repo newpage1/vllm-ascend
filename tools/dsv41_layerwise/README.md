@@ -234,3 +234,33 @@ t84 把边界数据面升级到 schema v2：transport 以**绝对行**寻址整�
   请求，多请求步无法判定归属，按 fail-closed 回 cold。
 - 本仓只负责"页几何 + 目标页"；整页字节的搬运与 rebase 在 transport 仓
   （t84），长 KV / index / SWA 的恢复仍走各自资源，不由本钩子覆盖。
+
+### 多请求 boundary 归属（t92）
+
+t87 的 `restore_target` 要求整步只有一个请求，多请求步一律回 cold，QPS16 下
+无法产生 layerwise 收益。t92 把归属改成**按请求**解析，仍只改本仓：
+
+- capture 记录按 `(step_id, request_id, resource_id)` 存（`_BOUNDARY_RECORD_LIMIT
+  = 4096`，按插入序淘汰），同一步里两个请求各自的 boundary 不再互相覆盖；
+  `boundary_record(resource_id, request_id=..., step_id=...)` 可点名查询。
+- `provide_boundary_rows(resource_id, snapshot_id, boundary_token,
+  request_id=None)`：按 token 命中唯一记录即返回；多个记录页/行不同而调用方
+  未点名 → `None`（不猜）。token 不符沿用 `"... ends at token ..."` 文案。
+- `restore_target(resource_id, boundary_token, request_id=None)`：点名时取该
+  请求的候选行，否则扫描本步所有行中 `prefix_end == token` 的候选；候选页
+  多于一个且未点名 → `None`；任何候选的 `prefix_end != token` → `None`；
+  **该请求本步 `used == 0`（kernel 不写 page，row4=0）→ `None`**，绝不把 0
+  当页。一个请求无法归属只影响它自己，其它请求照常恢复。
+- 设备自检 `npu_check_t92.py`（真实 kernel + 真实 `ForwardContext` + 真实
+  codec + 真 NPU ring）：`CAPTURE_OK [('req-a', 73, (70, 71, 72)),
+  ('req-b', 74, (103, 104, 105))] / RESTORE_OK 4 32 / ISOLATION_OK 4 5 /
+  UNSET_PAGE_FAIL_CLOSED_OK [73, 74] / NPU_CHECK_T92_PASSED`。
+
+已知边界（t92）：
+
+- transport 的边界 store（`_store_step_boundaries`）目前仍只取本步
+  `entries[0]` 的 token range，因此**服务端每次 commit 只能携带一个请求的
+  boundary**；引擎侧已按请求记录并可按 id 解析，等 transport 按请求发 spec
+  后即可直接生效。该项属 transport 仓，见 EVIDENCE-t92.md 的 finding F3。
+- 多请求同 token 同页（例如两个请求恰好复用到同一物理页）在未点名时仍按
+  歧义处理（`None`），由 transport 侧显式点名后再恢复。
