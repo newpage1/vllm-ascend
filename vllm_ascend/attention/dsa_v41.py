@@ -32,6 +32,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.attention.dsv41_layerwise_admission import (
     guard_layer_admission,
+    init_phase_bypass,
     notify_layer_produced,
     wait_for_layer_load,
 )
@@ -74,6 +75,12 @@ def dsa_v41_forward(
     # before its first cache read, then fail-closed admission, then record
     # the produced KV after the attention computes. Both are no-ops unless
     # the DSV4.1 layerwise connector enabled its registry in this process.
+    # Engine-init forwards (graph capture / profile dummies) carry no
+    # scheduler step, so no admission window can exist: bypass the hooks
+    # outright there instead of faking admission (t71).
+    if init_phase_bypass(layer_name):
+        attn.v41_impl.forward(attn, None, hidden_states, output)
+        return
     wait_for_layer_load(layer_name)
     guard_layer_admission(layer_name)
     attn.v41_impl.forward(attn, None, hidden_states, output)

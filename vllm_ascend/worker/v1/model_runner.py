@@ -128,6 +128,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_views_for_spec,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.dsv41_layerwise_admission import set_init_phase
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -4639,24 +4640,38 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
-        self.eplb_warmup()
-        if self.sparse_kv_offload_enabled:
-            allocate_kv_offload_topk_profile_buffers(
-                getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
-                self.vllm_config,
-                self.sparse_kv_offload_config,
-            )
-
-        mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-            # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
-            with disable_compilation(self.get_model()):
-                self._dummy_run(
-                    mc2_tokens_capacity, with_prefill=True, is_profile=True, randomize_inputs=randomize_inputs
+        # Engine-init forwards (t71): profile dummies carry no scheduler
+        # step, so the layerwise admission hooks must bypass, not fail.
+        set_init_phase(True)
+        try:
+            self.eplb_warmup()
+            if self.sparse_kv_offload_enabled:
+                allocate_kv_offload_topk_profile_buffers(
+                    getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
+                    self.vllm_config,
+                    self.sparse_kv_offload_config,
                 )
-        super().profile_run(randomize_inputs=randomize_inputs)
+
+            mc2_tokens_capacity = get_mc2_tokens_capacity()
+            if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
+                mc2_tokens_capacity, self.vllm_config
+            ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+                # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
+                with disable_compilation(self.get_model()):
+                    self._dummy_run(
+                        mc2_tokens_capacity, with_prefill=True, is_profile=True, randomize_inputs=randomize_inputs
+                    )
+            try:
+                super().profile_run(randomize_inputs=randomize_inputs)
+            except TypeError as exc:
+                # B11 (t71): vLLM 0.30 lane — GPUModelRunner.profile_run() does not
+                # accept ``randomize_inputs`` yet. Only fall back when the mismatch
+                # is about this kwarg so genuine errors still propagate.
+                if "randomize_inputs" not in str(exc):
+                    raise
+                super().profile_run()
+        finally:
+            set_init_phase(False)
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -6894,7 +6909,17 @@ class NPUModelRunner(GPUModelRunner):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             if self._should_align_cudagraph_capture_sizes():
                 graph_alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
-                self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment)
+                try:
+                    self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment)
+                except TypeError as exc:
+                    # B13 (t71): vLLM 0.30 lane keeps the pre-#60517 two-argument
+                    # form ``adjust_cudagraph_sizes_for_spec_decode(uniform_decode_query_len,
+                    # tensor_parallel_size)``. Only adapt on the arity mismatch.
+                    if "tensor_parallel_size" not in str(exc):
+                        raise
+                    self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+                        graph_alignment, tensor_parallel_size
+                    )
             # vLLM #60517 removed the `tensor_parallel_size` parameter on main.
             cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
                 min_cg_support=min_cg_support,

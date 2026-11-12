@@ -77,6 +77,10 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
+from vllm_ascend.attention.dsv41_layerwise_admission import (
+    set_init_phase,
+    synthetic_forward,
+)
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
@@ -992,6 +996,17 @@ class NPUWorker(WorkerBase):
             )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Engine-init forwards (t71): compile warmup dummies, kernel warmup
+        # and NPU graph capture carry no scheduler step, so the DSV4.1
+        # layerwise admission hooks must bypass instead of failing closed.
+        # Real request steps always run outside this wrapper.
+        set_init_phase(True)
+        try:
+            return self._compile_or_warm_up_model_impl()
+        finally:
+            set_init_phase(False)
+
+    def _compile_or_warm_up_model_impl(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
@@ -1433,11 +1448,16 @@ class NPUWorker(WorkerBase):
     # lives in the runtime_guard hook, see runtime_guard_idle_step.
     @runtime_guard_idle_step
     def execute_dummy_batch(self) -> None:
-        self.log_memory_stats()
-        num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        # Idle DP worker RPCs also need the current config for replay metadata.
-        with set_current_vllm_config(self.vllm_config):
-            self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
+        # Idle-DP dummy batches (t71) carry no scheduler step: they keep an
+        # idle DP rank in lockstep during a real step on other ranks. The
+        # DSV4.1 layerwise admission hooks must bypass (no admission window
+        # exists or may be faked); real request steps stay fail-closed.
+        with synthetic_forward():
+            self.log_memory_stats()
+            num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+            # Idle DP worker RPCs also need the current config for replay metadata.
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

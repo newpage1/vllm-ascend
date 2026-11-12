@@ -140,11 +140,22 @@ def prepare_ascend_kernel_block_sizes(
             and group_id < len(attn_groups)
             and attn_groups[group_id]
         ):
-            kernel_block_sizes[index] = select_common_block_size(
-                manager_block_size,
-                [attn_group.backend for attn_group in attn_groups[group_id]],
-                [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
-            )
+            try:
+                kernel_block_sizes[index] = select_common_block_size(
+                    manager_block_size,
+                    [attn_group.backend for attn_group in attn_groups[group_id]],
+                    [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
+                )
+            except TypeError as exc:
+                # B14 (t71): vLLM 0.30 lane — select_common_block_size() still
+                # takes (kv_manager_block_size, backends) only; the specs list
+                # is a vLLM-main extension. Only adapt on the arity mismatch.
+                if "select_common_block_size" not in str(exc):
+                    raise
+                kernel_block_sizes[index] = select_common_block_size(
+                    manager_block_size,
+                    [attn_group.backend for attn_group in attn_groups[group_id]],
+                )
         index += 1
     return kernel_block_sizes
 
