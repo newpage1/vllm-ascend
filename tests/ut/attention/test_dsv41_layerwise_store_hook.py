@@ -162,6 +162,14 @@ def test_store_hook_passes_the_layers_long_kv_cache() -> None:
     assert "long_kv_cache" in rendered and "kv_cache" in rendered, (
         f"second argument must read the layer's long KV cache tensors, got: {rendered}"
     )
+    # SWA-only V4.1 attentions carry no ``long_kv_cache``: the first c01 run
+    # crashed with AttributeError because the outer attribute read was not
+    # defensive. Pin the nested-getattr shape so the hook never dies on
+    # layers without a long cache (they store through registered caches).
+    assert rendered.count("getattr(") >= 2, (
+        "second argument must read long_kv_cache defensively "
+        f"(nested getattr), got: {rendered}"
+    )
 
 
 def test_capture_fake_path_does_not_double_store() -> None:

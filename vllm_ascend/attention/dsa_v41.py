@@ -92,8 +92,16 @@ def dsa_v41_forward(
     # V4.1 lane is the only attention family that never stores (t65 gap).
     # Guards inside (kv-transfer group + connector metadata) keep engine
     # init and non-layerwise serving unchanged.
+    # V4.1 runs both long-context and SWA-only layer variants through this
+    # op; SWA-only attentions carry no ``long_kv_cache``, so read the
+    # attribute defensively (an outer AttributeError here killed the first
+    # t75 c01 run). The wrapper sources the stored bytes from the caches it
+    # registered at startup; this argument is advisory for the stock path,
+    # so hand it over empty rather than skipping the hook -- a skipped hook
+    # is exactly the t75 silent hole.
     maybe_save_kv_layer_to_connector(
-        layer_name, list(getattr(attn.long_kv_cache, "kv_cache", ()) or ())
+        layer_name,
+        list(getattr(getattr(attn, "long_kv_cache", None), "kv_cache", ()) or ()),
     )
 
 
