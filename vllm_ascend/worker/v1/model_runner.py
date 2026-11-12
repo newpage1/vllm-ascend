@@ -129,6 +129,11 @@ from vllm_ascend.attention.attention_c8_mxfp import (
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsv41_layerwise_admission import set_init_phase
+from vllm_ascend.attention.dsv41_layerwise_c2 import (
+    NOT_BOUND,
+    bind_model_forward_step,
+    clear_step_request_view,
+)
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -3556,7 +3561,15 @@ class NPUModelRunner(GPUModelRunner):
                 )
         run_model = partial(self.model, **model_inputs)
 
+        # S1 layerwise C2: bind this forward to its scheduler step and run
+        # the TP uniform-step gate before any layer can restore a boundary.
+        # Both calls return immediately unless the layerwise connector
+        # installed its boundary codec, so stock serving is unchanged.
+        step_view_token: object = NOT_BOUND
         try:
+            step_view_token = bind_model_forward_step(
+                self, decoder_replay_dummy=decoder_replay_dummy
+            )
             if self.decoder_replay is not None:
                 self._prepare_decoder_replay(num_tokens_padded, decoder_replay_dummy)
             if self.enable_enpu:
@@ -3570,6 +3583,7 @@ class NPUModelRunner(GPUModelRunner):
             # A forward that raises must still retire the device-metadata
             # submission: otherwise the next submit() refuses to start and a
             # single request error wedges every DP rank of the instance.
+            clear_step_request_view(step_view_token)
             executor = getattr(forward_context, "device_metadata_executor", None)
             if executor is not None and executor.submission_in_flight:
                 executor.release()

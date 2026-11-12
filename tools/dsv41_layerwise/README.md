@@ -136,3 +136,32 @@ admission granted / KV produced，逐层去重），smoke 脚本据此收集验�
   lookup 已真实到达 MP server，但 IPC key 尚未接线（C2 边界/codec 属后续
   里程碑），因此本轮不产生真实 prefix 命中；t71 验收只要求前向跑通与
   admission 生命周期证据，不要求命中。
+
+## S1 C2 capture/restore hooks（t78）
+
+`vllm_ascend/attention/dsv41_layerwise_c2.py` 是 S1 的引擎侧接缝：它把
+C2 ring page 的真实请求视图交给 transport 侧 codec，并把 restore/capture
+挂到 `dsa_v41_forward` 的生命周期上。默认关闭——没有 connector 安装
+codec 时所有钩子立即返回，stock 路径、graph capture、profile dummy
+逐位不变。
+
+- 视图（引擎提供真实事实）：`DSV41BoundaryRequestView`（物理 ring page、
+  绝对 prefix_end、本步写入行、5 个位置控制字、compression phase/ratio）、
+  `DSV41BoundaryTensorView`（真实 compressor state 页、stride、两个 plane
+  的布局）、`DSV41StepRequestView`（scheduler step 与批次 request 顺序）。
+- 接缝（codec 实现）：`capture_layer_boundary(request_view, tensor_view)`
+  与 `restore_layer_boundary(...)`；wire 描述符（`BoundaryStateDescriptor`）
+  仍由 LMCache 侧 codec 构建，本仓不发布、不租约、不搬字节。
+- 时机：`dsa_v41_forward` 中 restore 在 `guard_layer_admission` 之前、
+  capture 在 `notify_layer_produced` 之前（"produced" 蕴含 "captured"）；
+  `NPUModelRunner._model_forward` 在进入模型前绑定 step 视图并跑一次 TP
+  一致步 gate（SUM all-reduce，只要任一 rank 报告失败或步号不一致，所有
+  rank 在下一个算子/collective 之前一起抛出）。
+- fail-closed：装了 codec 但真实前向没有绑定 step、ratio-2 层缺
+  compressor metadata、批大小与 metadata 不一致、步内行不属于本请求的
+  物理页、codec 抛错，一律 `DSV41LayerwiseC2Error`；不伪造命中、不跳过
+  已跳过的 token。
+
+已知边界（t78 收口时）：t77 的 C2 codec/prefix 复用尚在并行开发中，
+本仓只能以契约一致的 fake codec 验证 capture→restore 往返与未命中
+fail-closed；真实 prefix 命中要等 t77 落地后由 t79 复审闭环。

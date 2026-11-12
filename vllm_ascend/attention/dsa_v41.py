@@ -36,6 +36,10 @@ from vllm_ascend.attention.dsv41_layerwise_admission import (
     notify_layer_produced,
     wait_for_layer_load,
 )
+from vllm_ascend.attention.dsv41_layerwise_c2 import (
+    capture_layer_boundary_state,
+    restore_layer_boundary_state,
+)
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
@@ -83,8 +87,16 @@ def dsa_v41_forward(
         attn.v41_impl.forward(attn, None, hidden_states, output)
         return
     wait_for_layer_load(layer_name)
+    # S1: the C2 ring page of this request must be back in the scratch page
+    # before the compressor's first read. A codec that was installed but
+    # cannot prove the page raises here (fail-closed); with no codec this
+    # returns immediately and the stock path is untouched.
+    restore_layer_boundary_state(layer_name, attn)
     guard_layer_admission(layer_name)
     attn.v41_impl.forward(attn, None, hidden_states, output)
+    # S1: hand the rows this forward just wrote to the codec before the
+    # produced notification goes out, so "produced" implies "captured".
+    capture_layer_boundary_state(layer_name, attn)
     notify_layer_produced(layer_name)
     # Hand the freshly written KV to the layerwise connector (t75): the
     # engine-side store half of the S0 loop. The stock MP wrapper turns
