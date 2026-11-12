@@ -66,6 +66,11 @@ RING_ROWS_PER_PAGE = 32
 #: output base, input base and the physical ring page.
 POSITION_CONTROL_WORDS = 5
 
+#: Suffix of the registered cache that a ratio-2 compressor ring state lives
+#: in. The transport addresses those pages by absolute row while every other
+#: cache is addressed by block, so the two must never be confused.
+BOUNDARY_STATE_CACHE_SUFFIX = ".compressor.state_cache"
+
 
 class DSV41LayerwiseC2Error(RuntimeError):
     """The S1 layerwise C2 contract was violated (fail-closed)."""
@@ -221,6 +226,10 @@ _provider_installed = False
 # transport uses (the compressor state cache name). S0/S1 serve one request
 # per step, so the newest record is the boundary the step commits.
 _boundary_records: dict[str, _BoundaryRecord] = {}
+# Rows per page of every ratio-2 compressor ring, bound once from the model
+# at install time. The transport frames whole pages by this geometry, so it
+# must come from the real cache and never from a constant guess.
+_ring_geometry: dict[str, int] = {}
 _step_view: DSV41StepRequestView | None = None
 _step_view_previous: list[DSV41StepRequestView | None] = []
 _next_step_id = 0
@@ -669,13 +678,228 @@ def _token_int(boundary_token: Any) -> int | None:
         return None
 
 
-def install_boundary_provider(connector: Any = None) -> bool:
+def boundary_state_cache_name(name: Any) -> bool:
+    """True when a registered cache holds a ratio-2 compressor ring state."""
+    return isinstance(name, str) and name.endswith(BOUNDARY_STATE_CACHE_SUFFIX)
+
+
+def bind_ring_geometry(model: Any) -> dict[str, int]:
+    """Record the real rows-per-page of every compressor ring the model owns.
+
+    The transport frames a whole ring page, so it needs the page geometry of
+    the actual cache. Taking it from the model once (instead of a constant or
+    a guess) keeps stores and restores on the same row space the kernel uses,
+    including any layer whose ring size ever differs from the default.
+    """
+    geometry: dict[str, int] = {}
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return geometry
+    for module in modules():
+        impl = getattr(module, "v41_impl", None)
+        prefix = getattr(impl, "compressor_state_prefix", None)
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        compressor = getattr(module, "compressor", None)
+        state_cache = getattr(compressor, "state_cache", None)
+        kv_cache = getattr(state_cache, "kv_cache", None)
+        if not kv_cache:
+            continue
+        ring = kv_cache[0]
+        if not isinstance(ring, torch.Tensor) or ring.dim() < 2:
+            continue
+        rows = int(ring.shape[1])
+        if rows <= 0:
+            continue
+        geometry[prefix] = rows
+    _ring_geometry.update(geometry)
+    return geometry
+
+
+def _ring_rows_known(resource_id: Any) -> int | None:
+    rows = _ring_geometry.get(str(resource_id))
+    if rows is None:
+        return None
+    return int(rows) if int(rows) > 0 else None
+
+
+def ring_rows(resource_id: str) -> int:
+    """Rows per ring page of ``resource_id``, from the real cache geometry.
+
+    Installed as an attribute of :func:`provide_boundary_rows`; the transport
+    calls it before it frames a whole page. A resource whose geometry was
+    never observed raises instead of guessing 32 rows.
+    """
+    rows = _ring_rows_known(resource_id)
+    if rows is None:
+        raise DSV41LayerwiseC2Error(
+            f"no ring geometry is known for {resource_id!r}; refusing to frame "
+            "a boundary page whose row space was never observed"
+        )
+    return rows
+
+
+def _live_ring_metadata(resource_id: str) -> torch.Tensor | None:
+    """The live ``c2_ring_metadata`` of one boundary resource, if present."""
+    from vllm.forward_context import get_forward_context
+
+    try:
+        forward_context = get_forward_context()
+    except Exception:  # pragma: no cover - no context outside a forward
+        return None
+    attn_metadata = getattr(forward_context, "attn_metadata", None)
+    if not isinstance(attn_metadata, dict):
+        return None
+    metadata = attn_metadata.get(str(resource_id))
+    ring_metadata = getattr(metadata, "c2_ring_metadata", None)
+    if not isinstance(ring_metadata, torch.Tensor) or ring_metadata.dim() != 2:
+        return None
+    if int(ring_metadata.shape[0]) < POSITION_CONTROL_WORDS:
+        return None
+    if int(ring_metadata.shape[1]) < 1:
+        return None
+    return ring_metadata
+
+
+def restore_target(
+    resource_id: str,
+    boundary_token: Any,
+) -> tuple[int, int] | None:
+    """Name the new request's own ring page for a whole-page restore (S1).
+
+    Installed as an attribute of :func:`provide_boundary_rows`; the transport
+    calls it before it rebases a captured page onto the live request. Only a
+    forward that resumes exactly at the captured boundary qualifies: one real
+    request, ``prefix_end == boundary_token`` and a physical page taken from
+    that request's own ring metadata. Anything else returns ``None`` so the
+    transport stays fail-closed instead of writing a page nobody reads.
+    """
+    if not _provider_installed:
+        return None
+    view = _step_view
+    if view is None:
+        logger.warning(
+            "%s: restore target asked for %s before any step view was bound; "
+            "staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    if view.synthetic:
+        return None
+    if len(view.request_ids) != 1:
+        logger.warning(
+            "%s: restore target asked for %s with %d requests in the step; "
+            "a boundary page belongs to exactly one request, staying "
+            "fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+            len(view.request_ids),
+        )
+        return None
+    token = _token_int(boundary_token)
+    if token is None:
+        return None
+    ring_metadata = _live_ring_metadata(resource_id)
+    if ring_metadata is None:
+        logger.warning(
+            "%s: no live ring metadata for %s; the target page is unknown, "
+            "staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    prefix_end = int(ring_metadata[0, 0])
+    if prefix_end != token:
+        logger.warning(
+            "%s: %s resumes at token %d but the snapshot ends at %d; the "
+            "boundary does not apply, staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+            prefix_end,
+            token,
+        )
+        return None
+    rows = _ring_rows_known(resource_id)
+    if rows is None:
+        logger.warning(
+            "%s: no ring geometry for %s; cannot frame the restore page, "
+            "staying fail-closed",
+            DSV41_LAYERWISE_C2_TAG,
+            resource_id,
+        )
+        return None
+    return int(ring_metadata[4, 0]), rows
+
+
+def row_space_view(value: Any) -> torch.Tensor | None:
+    """Absolute-row view of a compressor ring page set, or None.
+
+    The kernel addresses ring slots as ``page * rows + position % rows`` and
+    the transport does the same, so both need one flat row axis. Only a
+    contiguous ``[pages, rows, 1, 2 * head]`` (or already 3-D) page set can
+    be viewed that way without moving bytes; anything else is refused.
+    """
+    if not isinstance(value, torch.Tensor):
+        return None
+    if value.dim() == 2:
+        return value
+    if value.dim() not in (3, 4):
+        return None
+    if value.dim() == 4 and int(value.shape[2]) != 1:
+        return None
+    if not value.is_contiguous():
+        return None
+    return value.view(-1, value.shape[-1])
+
+
+def use_row_space_views(worker: Any) -> int:
+    """Hand the transport absolute-row views of the boundary caches (S1).
+
+    KV registration already hashed the real ``[pages, rows, 1, 2 * head]``
+    geometry, and the engine still reads those caches by page. The transport
+    indexes boundary payloads by absolute row, so after registration the
+    adapter's own cache map is pointed at a view of the *same* storage. Only
+    boundary-state caches are touched; a cache that cannot be flattened is
+    left alone with a warning and the transport stays fail-closed for it.
+    """
+    caches = getattr(worker, "kv_caches", None)
+    if not isinstance(caches, dict):
+        return 0
+    swapped = 0
+    for name, value in list(caches.items()):
+        if not boundary_state_cache_name(name):
+            continue
+        wrapped = isinstance(value, tuple) and len(value) == 1
+        tensor = value[0] if wrapped else value
+        view = row_space_view(tensor)
+        if view is None:
+            logger.warning(
+                "%s: boundary cache %s cannot be viewed as absolute rows; the "
+                "transport stays fail-closed for it",
+                DSV41_LAYERWISE_C2_TAG,
+                name,
+            )
+            continue
+        if view is tensor:
+            continue
+        caches[name] = (view,) if wrapped else view
+        swapped += 1
+    return swapped
+
+
+def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
     """Install the engine boundary-row provider on the layerwise adapter.
 
     Called once per worker after KV registration. Connectors that are not
     the DSV4.1 layerwise transport simply do not expose
     ``worker_adapter.set_boundary_provider``, so this is a no-op for every
     other KV connector (stock serving included).
+
+    The provider also carries the two geometry hooks the transport asks for
+    (``ring_rows`` and ``restore_target``). When the model is given, its real
+    ring geometry is bound and the adapter's boundary caches are pointed at
+    absolute-row views of the same storage.
     """
     global _provider_installed
     if connector is None:
@@ -692,12 +916,20 @@ def install_boundary_provider(connector: Any = None) -> bool:
     if not callable(setter):
         return False
     setter(provide_boundary_rows)
+    setattr(provide_boundary_rows, "ring_rows", ring_rows)
+    setattr(provide_boundary_rows, "restore_target", restore_target)
+    if model is not None:
+        bind_ring_geometry(model)
+    swapped = use_row_space_views(worker)
     _provider_installed = True
     logger.info(
         "%s: boundary provider installed on %s: S1 snapshots take the rows "
-        "this forward really wrote",
+        "this forward really wrote (%d boundary cache(s) on an absolute-row "
+        "view, %d ring geometry record(s))",
         DSV41_LAYERWISE_C2_TAG,
         type(worker).__name__,
+        swapped,
+        len(_ring_geometry),
     )
     return True
 
@@ -772,7 +1004,10 @@ __all__ = [
     "bind_model_forward_step",
     "bind_step_request_view",
     "NOT_BOUND",
+    "BOUNDARY_STATE_CACHE_SUFFIX",
+    "bind_ring_geometry",
     "boundary_record",
+    "boundary_state_cache_name",
     "boundary_state_codec",
     "boundary_state_codec_is_set",
     "capture_layer_boundary_state",
@@ -784,9 +1019,13 @@ __all__ = [
     "note_step_failure",
     "provide_boundary_rows",
     "reset_step_state",
+    "restore_target",
+    "ring_rows",
     "restore_layer_boundary_state",
     "s1_capture_active",
     "set_boundary_state_codec",
+    "row_space_view",
     "step_failure_count",
     "step_id_counter",
+    "use_row_space_views",
 ]

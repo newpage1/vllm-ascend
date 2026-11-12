@@ -5061,9 +5061,10 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().register_kv_caches(kv_caches)
             # S1: once the layerwise transport has the plan, hand it the
             # provider that turns a boundary token into the real rows this
-            # engine wrote. Every other connector lacks set_boundary_provider,
-            # so this stays a no-op for stock serving.
-            install_boundary_provider()
+            # engine wrote, together with the model's real ring geometry.
+            # Every other connector lacks set_boundary_provider, so this
+            # stays a no-op for stock serving.
+            install_boundary_provider(model=self.model)
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,

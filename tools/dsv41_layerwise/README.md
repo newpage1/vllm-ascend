@@ -199,3 +199,38 @@ codec：
 - `resource_id` 与 `execution_layer` 的映射是 `<execution_layer>` +
   `.compressor.state_cache`，由 `vllm_impl.compressor_state_prefix` 提供，
   不接受字符串改写推导。
+
+### 整页 store/restore 的引擎侧几何（t87）
+
+t84 把边界数据面升级到 schema v2：transport 以**绝对行**寻址整个 ring page，
+并要求引擎提供两件事——`ring_rows(resource_id) -> int`（每页行数）与
+`restore_target(resource_id, boundary_token) -> (target_page, ring_rows)`（新
+请求自己的目标页）。t87 在引擎侧原生落地这两个钩子，仍只改本仓：
+
+- `ring_rows` 的几何**来自真实 cache**：`install_boundary_provider(model=...)`
+  时扫 `model.modules()` 里带 `v41_impl.compressor_state_prefix` 的层，读
+  `compressor.state_cache.kv_cache[0].shape[1]` 存入 `_ring_geometry`。几何
+  未知时抛 `DSV41LayerwiseC2Error`，绝不默认 32。
+- `restore_target` 只在"新请求正好在捕获边界续上"时给出目标页：本步必须是
+  单请求、非 synthetic 的真实 forward，live `c2_ring_metadata` 的
+  `prefix_end` 必须等于 `boundary_token`，目标页取该请求自己的
+  `block_table[:,0]`（metadata row4）。任何不符返回 `None`，transport 据此
+  fail-closed 回 cold —— 不猜页、不把命中静默改 0。
+- 张量几何：注册哈希仍按真实 `[pages, 32, 1, 2*head]` 计算；`register_kv_caches`
+  之后，`use_row_space_views` 只把 **boundary 资源**（`*.compressor.state_cache`）
+  在 adapter 里的条目换成同一 storage 的 2-D 行视图（`view(-1, 2*head)`，
+  `data_ptr` 不变），非 boundary 资源保持原样。
+- 两个钩子以属性形式挂在真实 provider 函数上
+  （`provide_boundary_rows.ring_rows` / `.restore_target`），与 t90 的契约一致；
+  未安装、非 layerwise connector、或几何未知时一律 cold-only。
+- 镜像内自检 `image_self_check_t87.py`（挂载三仓，`--network none`）用真实
+  codec 跑出：`PROVIDER_OK / GEOMETRY_OK 32 (192, 16) / CAPTURE_OK 6 0 (70, 71, 72)
+  / STORE_OK 2 (32, 16) 2210 / RESTORE_OK 4 32 / FAIL_CLOSED_OK /
+  IMAGE_SELF_CHECK_T87_PASSED`。
+
+已知边界（t87）：
+
+- `restore_target` 只支持单请求步：transport 的 boundary page 属于恰好一个
+  请求，多请求步无法判定归属，按 fail-closed 回 cold。
+- 本仓只负责"页几何 + 目标页"；整页字节的搬运与 rebase 在 transport 仓
+  （t84），长 KV / index / SWA 的恢复仍走各自资源，不由本钩子覆盖。
