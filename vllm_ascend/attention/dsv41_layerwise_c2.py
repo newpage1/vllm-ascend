@@ -1230,6 +1230,29 @@ def use_row_space_views(worker: Any) -> int:
     return swapped
 
 
+def step_end_token(request_id: str) -> int | None:
+    """Real step end of ``request_id``'s latest captured boundary (t111).
+
+    The transport's F5 alignment asks the engine where the step really
+    ends before choosing the boundary token, so the token the transport
+    hands :func:`provide_boundary_rows` matches the capture exactly
+    (before t111 the transport could only offer the store's chunk end,
+    e.g. 3328, while the capture ends at the full step end, e.g. 3529 —
+    every boundary stayed cold).
+
+    Returns ``None`` when no capture exists for the request; the
+    transport then keeps the chunk end (cold stays cold, never guessed).
+    """
+    newest: _BoundaryRecord | None = None
+    for record in _boundary_records.values():
+        if record.request_id != request_id:
+            continue
+        newest = record
+    if newest is None:
+        return None
+    return newest.end_token
+
+
 def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
     """Install the engine boundary-row provider on the layerwise adapter.
 
@@ -1238,10 +1261,12 @@ def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
     ``worker_adapter.set_boundary_provider``, so this is a no-op for every
     other KV connector (stock serving included).
 
-    The provider also carries the two geometry hooks the transport asks for
-    (``ring_rows`` and ``restore_target``). When the model is given, its real
-    ring geometry is bound and the adapter's boundary caches are pointed at
-    absolute-row views of the same storage.
+    The provider also carries the hooks the transport asks for:
+    ``ring_rows`` and ``restore_target`` (page geometry), and
+    ``step_end_token`` (t111 F5 alignment — where the request's current
+    step really ends). When the model is given, its real ring geometry is
+    bound and the adapter's boundary caches are pointed at absolute-row
+    views of the same storage.
     """
     global _provider_installed, _activation_generation
     if connector is None:
@@ -1260,6 +1285,9 @@ def install_boundary_provider(connector: Any = None, model: Any = None) -> bool:
     setter(provide_boundary_rows)
     setattr(provide_boundary_rows, "ring_rows", ring_rows)
     setattr(provide_boundary_rows, "restore_target", restore_target)
+    # t111: F5 alignment hook — the transport asks the engine for the
+    # step's real end token before fixing the boundary token.
+    setattr(provide_boundary_rows, "step_end_token", step_end_token)
     if model is not None:
         bind_ring_geometry(model)
     swapped = use_row_space_views(worker)
