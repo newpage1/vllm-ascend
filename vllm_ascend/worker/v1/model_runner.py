@@ -121,6 +121,7 @@ from vllm.v1.worker.utils import (
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention import dsv41_lw_v2_boundary
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -128,7 +129,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_views_for_spec,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
-from vllm_ascend.attention.dsv41_layerwise_admission import set_init_phase
+from vllm_ascend.attention.dsv41_layerwise_admission import init_phase_active, set_init_phase
 from vllm_ascend.attention.dsv41_layerwise_c2 import (
     NOT_BOUND,
     bind_model_forward_step,
@@ -3567,9 +3568,18 @@ class NPUModelRunner(GPUModelRunner):
         # Both calls return immediately unless the layerwise connector
         # installed its boundary codec, so stock serving is unchanged.
         step_view_token: object = NOT_BOUND
+        # DSV4.1 layerwise v2 binds the same forward for its boundary codec
+        # (real request/prefix/page facts, no admission gate). It is inert
+        # until a v2 connector installed a codec.
+        lw_v2_step_token: object = None
         try:
             step_view_token = bind_model_forward_step(
                 self, decoder_replay_dummy=decoder_replay_dummy
+            )
+            lw_v2_step_token = dsv41_lw_v2_boundary.bind_forward_step(
+                self,
+                decoder_replay_dummy=decoder_replay_dummy,
+                synthetic=init_phase_active(),
             )
             if self.decoder_replay is not None:
                 self._prepare_decoder_replay(num_tokens_padded, decoder_replay_dummy)
@@ -3585,6 +3595,7 @@ class NPUModelRunner(GPUModelRunner):
             # submission: otherwise the next submit() refuses to start and a
             # single request error wedges every DP rank of the instance.
             clear_step_request_view(step_view_token)
+            dsv41_lw_v2_boundary.clear_forward_step(lw_v2_step_token)
             executor = getattr(forward_context, "device_metadata_executor", None)
             if executor is not None and executor.submission_in_flight:
                 executor.release()
@@ -5065,6 +5076,11 @@ class NPUModelRunner(GPUModelRunner):
             # Every other connector lacks set_boundary_provider, so this
             # stays a no-op for stock serving.
             install_boundary_provider(model=self.model)
+            # DSV4.1 layerwise v2: bind the engine seam to the connector and
+            # install the boundary codec before the first real forward. Stock
+            # connectors are not layerwise v2 connectors, so this returns False
+            # without touching them.
+            dsv41_lw_v2_boundary.install_from_connector(model=self.model)
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
