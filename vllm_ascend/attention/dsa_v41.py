@@ -29,7 +29,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention import dsv41_sampling
+from vllm_ascend.attention import dsv41_lw_v2, dsv41_sampling
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.attention.dsv41_layerwise_admission import (
     guard_layer_admission,
@@ -86,6 +86,24 @@ def dsa_v41_forward(
     # outright there instead of faking admission (t71).
     if init_phase_bypass(layer_name):
         attn.v41_impl.forward(attn, None, hidden_states, output)
+        return
+    # Layerwise v2 (contract 1.4): a bound v2 connector takes over this layer.
+    # Only a group head (source layer 2/8/14/20) waits for its group's load,
+    # restores its compressor boundary, and after the forward captures that
+    # boundary and submits the group's producer store. Every other layer is a
+    # pure no-op inside ``run_group_forward`` -- no RPC, future, ring page or
+    # transfer counter. Exceptions propagate on purpose: once the scheduler has
+    # skipped a prefix, a failed group load must fail this step instead of
+    # resuming local computation. The legacy admission/lease/C2 hooks below are
+    # not touched while a v2 binding is installed; with v2 disabled this branch
+    # does not exist and the stock/legacy path is bit-identical.
+    lw_v2_binding = dsv41_lw_v2.lw_v2_engine()
+    if lw_v2_binding is not None:
+        dsv41_lw_v2.run_group_forward(
+            lw_v2_binding,
+            layer_name,
+            lambda: attn.v41_impl.forward(attn, None, hidden_states, output),
+        )
         return
     wait_for_layer_load(layer_name)
     # S1: the C2 ring page of this request must be back in the scratch page

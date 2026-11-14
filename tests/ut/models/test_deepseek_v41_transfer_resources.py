@@ -3,6 +3,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -105,3 +106,83 @@ def test_invalid_source_graph_fails_before_cache_registration(text_config, field
     setattr(text_config, field, value)
     with pytest.raises(ValueError, match=message):
         build_layer_plan(text_config)
+
+
+build_transfer_groups = TOPOLOGY.build_transfer_groups
+validate_lw_v2_topology = TOPOLOGY.validate_lw_v2_topology
+
+
+def _execution_layer(index: int, prefix: str = "model") -> str:
+    return f"{prefix}.layers.{index}.self_attn.attn"
+
+
+def _dispatch_layer(index: int, prefix: str = "model") -> str:
+    return f"{prefix}.layers.{index}.self_attn.v41_attn"
+
+
+def test_transfer_groups_cover_the_four_kv_sources(text_config):
+    topology = build_layer_plan(text_config)
+    validate_lw_v2_topology(topology)
+    groups = build_transfer_groups(topology)
+    assert [group.group_id for group in groups] == ["g2", "g8", "g14", "g20"]
+    assert [group.source_layer for group in groups] == [2, 8, 14, 20]
+    assert [group.producer_layer for group in groups] == [2, 8, 14, 20]
+    assert [group.readiness_layer for group in groups] == [_execution_layer(i) for i in (2, 8, 14, 20)]
+    assert [group.dispatch_layer for group in groups] == [_dispatch_layer(i) for i in (2, 8, 14, 20)]
+    assert [group.consumer_layers for group in groups] == [
+        tuple(_execution_layer(i) for i in range(2, 8)),
+        tuple(_execution_layer(i) for i in range(8, 14)),
+        tuple(_execution_layer(i) for i in range(14, 20)),
+        tuple(_execution_layer(i) for i in range(20, 40)),
+    ]
+    assert [len(group.transfer_resources) for group in groups] == [2, 2, 2, 2]
+    assert sum(group.transfer_resource_count for group in groups) == 11
+    assert [group.source_layer for group in groups if group.has_boundary] == [2, 8, 14]
+    assert groups[-1].boundary_resource is None
+    swa = [resource for resource in topology.cache_resources() if resource.cache_kind == "swa"]
+    assert len(swa) == 40
+    assert not any(resource.cache_kind == "swa" for group in groups for resource in group.transfer_resources)
+
+
+def test_group_resources_keep_registered_names_and_true_consumer_subsets(text_config):
+    groups = {group.group_id: group for group in build_transfer_groups(build_layer_plan(text_config))}
+    long_kv, index_k = groups["g20"].transfer_resources
+    assert long_kv.cache_name == "model.layers.20.self_attn.long_kv_cache"
+    assert long_kv.consumer_layers == tuple(range(20, 40))
+    assert index_k.cache_name == "model.layers.20.self_attn.indexer.k_cache"
+    assert index_k.consumer_layers == (20, 24, 28, 32, 36)
+    assert groups["g20"].has_boundary is False
+    assert groups["g2"].boundary_resource.cache_name == "model.layers.2.self_attn.compressor.state_cache"
+
+
+def test_group_builder_rejects_a_source_without_a_source_role(text_config):
+    inconsistent = replace(build_layer_plan(text_config), kv_source_layer_ids=(2, 8, 14, 20, 26))
+    with pytest.raises(ValueError, match="has no long KV cache"):
+        build_transfer_groups(inconsistent)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("kv_source_layer_ids", (2, 8, 14, 20, 24), "expects KV source layers"),
+        ("kv_source_layer_ids", (8, 2, 14, 20), "strictly increasing"),
+        ("compress_ratios", [0, 0] + [2] * 38, "boundary sources"),
+        ("num_hidden_layers", 41, "backbone layers"),
+        ("num_hidden_layers", 2, "backbone layers"),
+    ],
+)
+def test_lw_v2_topology_rejects_any_other_layout(text_config, field, value, message):
+    setattr(text_config, field, value)
+    with pytest.raises(ValueError, match=message):
+        validate_lw_v2_topology(build_layer_plan(text_config))
+
+
+def test_lw_v2_topology_rejects_a_moved_consumer_segment(text_config):
+    topology = build_layer_plan(text_config)
+    moved = SimpleNamespace(
+        layers=topology.layers,
+        kv_source_layer_ids=topology.kv_source_layer_ids,
+        kv_consumers=lambda source: (2,) if source == 2 else topology.kv_consumers(source),
+    )
+    with pytest.raises(ValueError, match="consumers"):
+        validate_lw_v2_topology(moved)

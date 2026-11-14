@@ -5,6 +5,33 @@
 from dataclasses import dataclass
 from typing import Any, Literal
 
+#: KV source layers of the fixed first-phase layerwise v2 topology. Each one
+#: owns a transfer group; the engine only waits/saves at these layers.
+DSV41_LW_V2_SOURCE_LAYERS: tuple[int, ...] = (2, 8, 14, 20)
+
+#: Sources that carry a compressor boundary: every source whose compression
+#: ratio is 2. The final source (20) is the ratio-1 candidate segment tail and
+#: owns token-range state only.
+DSV41_LW_V2_BOUNDARY_SOURCE_LAYERS: tuple[int, ...] = (2, 8, 14)
+
+#: Backbone depth the v2 group table is defined for.
+DSV41_LW_V2_BACKBONE_LAYERS = 40
+
+#: Compression ratio whose layers own a compressor boundary (ring) state.
+DSV41_BOUNDARY_COMPRESS_RATIO = 2
+
+#: KV consumer segment per group (inclusive). Kept explicit so a topology
+#: change cannot silently move a layer between groups.
+DSV41_LW_V2_CONSUMER_SEGMENTS: tuple[tuple[int, tuple[int, ...]], ...] = (
+    (2, (2, 3, 4, 5, 6, 7)),
+    (8, (8, 9, 10, 11, 12, 13)),
+    (14, (14, 15, 16, 17, 18, 19)),
+    (
+        20,
+        (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39),
+    ),
+)
+
 
 @dataclass(frozen=True)
 class DeepseekV41LayerRole:
@@ -64,6 +91,48 @@ class DeepseekV41CacheResource:
 
 
 @dataclass(frozen=True)
+class DeepseekV41TransferGroup:
+    """One KV-source transfer group of the layerwise v2 protocol.
+
+    The group head is the source layer: execution is sequential, so a single
+    wait at the head covers every consumer layer of the group. The head is
+    also the only layer that may save the group's freshly produced state.
+
+    ``transfer_resources`` holds the token-range resources only (long KV and
+    index K, each keeping its original registered descriptor). The compressor
+    boundary is tracked separately because it is not a token-range plane and
+    is absent for the final source. SWA caches never enter a transfer group;
+    the engine recomputes them inside the bounded replay window.
+    """
+
+    group_id: str
+    source_layer: int
+    attention_prefix: str
+    readiness_layer: str
+    dispatch_layer: str
+    consumer_layers: tuple[str, ...]
+    transfer_resources: tuple[DeepseekV41CacheResource, ...]
+    boundary_resource: DeepseekV41CacheResource | None = None
+
+    @property
+    def token_range_resources(self) -> tuple[DeepseekV41CacheResource, ...]:
+        return self.transfer_resources
+
+    @property
+    def producer_layer(self) -> int:
+        """The head layer that produces the group's state."""
+        return self.source_layer
+
+    @property
+    def has_boundary(self) -> bool:
+        return self.boundary_resource is not None
+
+    @property
+    def transfer_resource_count(self) -> int:
+        return len(self.transfer_resources) + (0 if self.boundary_resource is None else 1)
+
+
+@dataclass(frozen=True)
 class DSV41LayerBinding:
     """Explicit identity binding for one DSV4.1 attention object.
 
@@ -87,6 +156,12 @@ class DSV41LayerBinding:
     execution_layer_name: str
 
 
+def _attention_cache_prefix(prefix: str, layer_idx: int) -> str:
+    """Return the registered attention prefix of one backbone layer."""
+    root = f"{prefix}." if prefix else ""
+    return f"{root}layers.{layer_idx}.self_attn"
+
+
 def build_cache_resources(
     topology: DeepseekV41Topology,
     *,
@@ -107,10 +182,9 @@ def build_cache_resources(
         Scratch compressor state is included explicitly for snapshot planning.
     """
     resources: list[DeepseekV41CacheResource] = []
-    root = f"{prefix}." if prefix else ""
     for role in topology.layers:
         layer_idx = role.layer_idx
-        cache_prefix = f"{root}layers.{layer_idx}.self_attn"
+        cache_prefix = _attention_cache_prefix(prefix, layer_idx)
         resources.append(DeepseekV41CacheResource(f"{cache_prefix}.swa_cache", "swa", layer_idx, (layer_idx,)))
         if not role.is_kv_source:
             continue
@@ -133,13 +207,142 @@ def build_cache_resources(
                     f"{cache_prefix}.indexer.k_cache_folded", "folded_index_k", layer_idx, index_readers
                 )
             )
-        if role.compress_ratio == 2:
+        if role.compress_ratio == DSV41_BOUNDARY_COMPRESS_RATIO:
             resources.append(
                 DeepseekV41CacheResource(
                     f"{cache_prefix}.compressor.state_cache", "compressor_state", layer_idx, (layer_idx,)
                 )
             )
     return tuple(resources)
+
+
+def build_transfer_groups(
+    topology: DeepseekV41Topology, *, prefix: str = "model"
+) -> tuple[DeepseekV41TransferGroup, ...]:
+    """Group the KV-source caches into the layerwise v2 transfer groups.
+
+    Pure: reads only the immutable topology and derives the same registered
+    names as :func:`build_cache_resources`. No tensor is allocated, no RPC is
+    issued, and no runtime state is touched, so the result can be used both
+    for the engine-side layer dispatch and for plan validation.
+
+    Args:
+        topology: Backbone topology returned by ``build_layer_plan``.
+        prefix: Model root before ``layers.<index>.self_attn``.
+
+    Returns:
+        One group per KV source, in source order. Each resource keeps its
+        original registered descriptor; the group consumer union is the
+        ordered union of its resources' consumers. SWA is never a group member.
+
+    Raises:
+        ValueError: If sources are not plain, strictly increasing integers, a
+            source lacks its long KV or index K cache, or a transfer cache has
+            no KV-source owner. The fixed v2 layout itself is enforced by
+            :func:`validate_lw_v2_topology`.
+    """
+    sources = tuple(topology.kv_source_layer_ids)
+    if not sources:
+        raise ValueError("DSV41 layerwise v2 needs at least one KV source layer")
+    if any(type(source) is not int for source in sources):
+        raise ValueError(f"KV source ids must be plain ints, got {sources!r}")
+    if sources != tuple(sorted(set(sources))):
+        raise ValueError(f"KV source ids must be strictly increasing, got {sources!r}")
+
+    grouped: dict[int, dict[str, DeepseekV41CacheResource]] = {source: {} for source in sources}
+    for resource in topology.cache_resources(prefix=prefix, include_folded_index=False):
+        if resource.cache_kind == "swa":
+            # SWA is recomputed by the engine inside the bounded replay window;
+            # it is registered but never transferred (contract 1.2).
+            continue
+        owned = grouped.get(resource.producer_layer)
+        if owned is None:
+            raise ValueError(
+                f"{resource.cache_name} is not produced by a KV source layer: {resource.producer_layer}"
+            )
+        if resource.cache_kind in owned:
+            raise ValueError(f"Layer {resource.producer_layer} registers two {resource.cache_kind} caches")
+        owned[resource.cache_kind] = resource
+
+    execution_positions = {role.layer_idx: index for index, role in enumerate(topology.layers)}
+    groups: list[DeepseekV41TransferGroup] = []
+    for source in sources:
+        owned = grouped[source]
+        long_kv = owned.get("long_kv")
+        if long_kv is None:
+            raise ValueError(f"KV source {source} has no long KV cache")
+        index_k = owned.get("index_k")
+        if index_k is None:
+            raise ValueError(f"KV source {source} has no index K cache")
+        boundary = owned.get("compressor_state")
+        unsupported = sorted(set(owned) - {"long_kv", "index_k", "compressor_state"})
+        if unsupported:
+            raise ValueError(f"KV source {source} has unsupported transfer caches: {unsupported}")
+        attention_prefix = _attention_cache_prefix(prefix, source)
+        groups.append(
+            DeepseekV41TransferGroup(
+                group_id=f"g{source}",
+                source_layer=source,
+                attention_prefix=attention_prefix,
+                readiness_layer=f"{attention_prefix}.attn",
+                dispatch_layer=f"{attention_prefix}.v41_attn",
+                consumer_layers=tuple(
+                    f"{_attention_cache_prefix(prefix, layer)}.attn"
+                    for layer in sorted(
+                        {*long_kv.consumer_layers, *index_k.consumer_layers},
+                        key=execution_positions.__getitem__,
+                    )
+                ),
+                transfer_resources=(long_kv, index_k),
+                boundary_resource=boundary,
+            )
+        )
+    return tuple(groups)
+
+
+def validate_lw_v2_topology(topology: DeepseekV41Topology) -> None:
+    """Validate the fixed first-phase DSV4.1 layerwise v2 topology.
+
+    The v2 transfer set is defined for exactly four KV source groups (layers
+    2/8/14/20), boundaries on 2/8/14 and 40 backbone layers. Any other layout
+    would silently change the registered transfer set, so the engine seam
+    rejects it at bind time instead of degrading to a different plan.
+
+    Args:
+        topology: Backbone topology returned by ``build_layer_plan``.
+
+    Raises:
+        ValueError: If the backbone depth, KV source layers, boundary sources,
+            or per-source consumer segments differ from the v2 topology.
+    """
+    if len(topology.layers) != DSV41_LW_V2_BACKBONE_LAYERS:
+        raise ValueError(
+            f"DSV41 layerwise v2 expects {DSV41_LW_V2_BACKBONE_LAYERS} backbone layers, "
+            f"got {len(topology.layers)}"
+        )
+    sources = tuple(topology.kv_source_layer_ids)
+    if any(type(source) is not int for source in sources):
+        raise ValueError(f"KV source ids must be plain ints, got {sources!r}")
+    if sources != DSV41_LW_V2_SOURCE_LAYERS:
+        raise ValueError(
+            f"DSV41 layerwise v2 expects KV source layers {DSV41_LW_V2_SOURCE_LAYERS}, got {sources}"
+        )
+    boundary_sources = tuple(
+        role.layer_idx
+        for role in topology.layers
+        if role.is_kv_source and role.compress_ratio == DSV41_BOUNDARY_COMPRESS_RATIO
+    )
+    if boundary_sources != DSV41_LW_V2_BOUNDARY_SOURCE_LAYERS:
+        raise ValueError(
+            f"DSV41 layerwise v2 expects boundary sources {DSV41_LW_V2_BOUNDARY_SOURCE_LAYERS}, "
+            f"got {boundary_sources}"
+        )
+    for source, expected_consumers in DSV41_LW_V2_CONSUMER_SEGMENTS:
+        consumers = topology.kv_consumers(source)
+        if consumers != expected_consumers:
+            raise ValueError(
+                f"DSV41 layerwise v2 expects consumers {expected_consumers} for group g{source}, got {consumers}"
+            )
 
 
 def build_layer_plan(config: Any) -> DeepseekV41Topology:
