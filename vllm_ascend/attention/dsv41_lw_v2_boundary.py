@@ -53,9 +53,10 @@ DSV41_LW_V2_BOUNDARY_RESOURCE_COUNT = len(DSV41_LW_V2_BOUNDARY_SOURCE_LAYERS)
 #: kernel: ``(prefix_end, step_tokens, out_base, in_base, ring_page)``.
 POSITION_CONTROL_WORDS = 5
 
-#: The cache resources registered by ``build_cache_resources`` are named with
-#: the default ``model`` root; the connector plan uses the same prefix.
-DSV41_LW_V2_MODEL_PREFIX = "model"
+#: Marker between the model root and the per-layer attention modules.  The
+#: real root is whatever the live model registered (for DSV4.1 under vLLM this
+#: is ``language_model.model``); it is never assumed to be ``model``.
+_MODEL_PREFIX_MARKER = ".layers."
 
 #: Error code carried by :class:`DSV41BoundaryNotBoundError`.
 BOUNDARY_NOT_BOUND = "BOUNDARY_NOT_BOUND"
@@ -438,8 +439,9 @@ def install_from_connector(model: Any, connector: Any | None = None) -> bool:
 
     Called from ``initialize_kv_cache`` after the connector registered the KV
     caches. Stock connectors are left completely untouched (returns False).
-    For a v2 connector this binds the engine seam (idempotent), then installs
-    the boundary codec the connector exposes. A v2 connector without a codec
+    For a v2 connector this binds the engine seam (idempotent) with the model
+    root resolved from the live plan/registration, then installs the boundary
+    codec the connector exposes. A v2 connector without a codec
     logs and stays inert; the connector itself already fails closed with
     ``BOUNDARY_NOT_BOUND`` the moment a real boundary hit appears.
     """
@@ -462,7 +464,9 @@ def install_from_connector(model: Any, connector: Any | None = None) -> bool:
     binding = lw_v2_engine()
     if binding is None or binding.hooks is not connector:
         bind_lw_v2_engine(
-            connector, topology=topology, prefix=DSV41_LW_V2_MODEL_PREFIX
+            connector,
+            topology=topology,
+            prefix=_resolve_model_prefix(connector, model),
         )
     codec = getattr(connector, "boundary_codec", None)
     if codec is None:
@@ -592,6 +596,43 @@ def _validate_codec(codec: Any) -> None:
                 f"boundary codec {name} must accept (request_view, tensor_view, "
                 "*, stream=None)"
             ) from exc
+
+
+def _resolve_model_prefix(connector: Any, model: Any) -> str:
+    """Derive the live model root instead of hard-coding ``"model"``.
+
+    The connector's grouped plan is built from the names the worker really
+    registered, so its first execution layer carries the real root (for
+    example ``language_model.model``).  When no plan is bound yet, fall back
+    to the live compressor-state resource names.  Anything else fails closed:
+    binding the engine seam with a guessed root would make every real capture
+    look up the wrong dispatch layer.
+    """
+    plan = getattr(connector, "grouped_plan", None)
+    base = getattr(plan, "base", None)
+    layer_order = getattr(base, "layer_order", None)
+    if layer_order:
+        layer = layer_order[0]
+        if isinstance(layer, str) and _MODEL_PREFIX_MARKER in layer:
+            prefix = layer.split(_MODEL_PREFIX_MARKER, 1)[0]
+            if prefix:
+                return prefix
+    modules = getattr(model, "modules", None)
+    if callable(modules):
+        for module in modules():
+            impl = getattr(module, "v41_impl", None)
+            resource_id = getattr(impl, "compressor_state_prefix", None)
+            if (
+                isinstance(resource_id, str)
+                and _MODEL_PREFIX_MARKER in resource_id
+            ):
+                prefix = resource_id.split(_MODEL_PREFIX_MARKER, 1)[0]
+                if prefix:
+                    return prefix
+    raise DSV41BoundaryBindingError(
+        "cannot resolve the layerwise v2 model prefix from the connector plan "
+        "or the live compressor-state resources"
+    )
 
 
 def _expected_boundary_resource_ids(binding: Any) -> tuple[str, ...]:

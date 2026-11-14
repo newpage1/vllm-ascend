@@ -150,15 +150,23 @@ class _RecordingCodec:
 class _FakeConnector:
     """Structural double of DSV41LwV2Connector's public seam."""
 
-    def __init__(self, *, step=None, codec=None) -> None:
+    def __init__(self, *, step=None, codec=None, prefix="model", plan=True) -> None:
         self._step = step
         self._codec = codec
+        self._prefix = prefix
+        self._plan = plan
         self.bound_hook = None
         self.events: list[tuple[str, str]] = []
 
     @property
     def grouped_plan(self):
-        return object()
+        if not self._plan:
+            return None
+        # The production plan derives from the registered cache names, so its
+        # first layer carries the real model root (not a hard-coded "model").
+        return SimpleNamespace(
+            base=SimpleNamespace(layer_order=(_execution(0, self._prefix),))
+        )
 
     @property
     def current_step(self):
@@ -191,23 +199,25 @@ def _ring(*, pages: int = 6, rows: int = 8, head: int = 2, dtype=torch.float32) 
     return torch.zeros((pages, rows, 2 * head), dtype=dtype)
 
 
-def _compressor_module(layer: int, ring: torch.Tensor):
+def _compressor_module(layer: int, ring: torch.Tensor, prefix: str = "model"):
     return SimpleNamespace(
         v41_impl=SimpleNamespace(
-            compressor_state_prefix=_resource(layer), layer_name=_execution(layer)
+            compressor_state_prefix=_resource(layer, prefix),
+            layer_name=_execution(layer, prefix),
         ),
         compressor=SimpleNamespace(state_cache=SimpleNamespace(kv_cache=[ring])),
     )
 
 
-def _attention(layer: int, ring: torch.Tensor):
+def _attention(layer: int, ring: torch.Tensor, prefix: str = "model"):
     return SimpleNamespace(
         v41_impl=SimpleNamespace(
-            compressor_state_prefix=_resource(layer), layer_name=_execution(layer)
+            compressor_state_prefix=_resource(layer, prefix),
+            layer_name=_execution(layer, prefix),
         ),
         compressor=SimpleNamespace(state_cache=SimpleNamespace(kv_cache=[ring])),
-        v41_layer_name=_dispatch(layer),
-        layerwise_execution_layer=_execution(layer),
+        v41_layer_name=_dispatch(layer, prefix),
+        layerwise_execution_layer=_execution(layer, prefix),
     )
 
 
@@ -393,6 +403,69 @@ def test_install_from_connector_binds_engine_and_installs_codec(text_config):
     assert binding is not None and binding.hooks is connector
     assert BOUNDARY.lw_v2_boundary_codec() is codec
     assert isinstance(connector.bound_hook, DSV41LwV2BoundaryHook)
+
+
+def test_install_from_connector_uses_the_registered_model_prefix(
+    text_config, _isolated
+):
+    prefix = "language_model.model"
+    codec = _RecordingCodec()
+    connector = _FakeConnector(codec=codec, prefix=prefix)
+    rings = {layer: _ring() for layer in BOUNDARY_LAYERS}
+    model = _FakeModel(
+        [
+            _compressor_module(layer, rings[layer], prefix=prefix)
+            for layer in BOUNDARY_LAYERS
+        ],
+        config=text_config,
+    )
+
+    assert BOUNDARY.install_from_connector(model=model, connector=connector) is True
+    binding = SEAM.lw_v2_engine()
+    assert binding is not None and binding.prefix == prefix
+    assert all(group.readiness_layer.startswith(prefix) for group in binding.groups)
+
+    _isolated.no_compile_layers = {
+        _dispatch(layer, prefix): _attention(layer, rings[layer], prefix=prefix)
+        for layer in BOUNDARY_LAYERS
+    }
+    _isolated.attn_metadata = {
+        _resource(layer, prefix): _metadata([3, 7])
+        for layer in BOUNDARY_LAYERS
+    }
+    runner = _FakeRunner(
+        req_ids=["r0", "r1"], computed=[5, 9], pages=[3, 7], query_lens=[2, 3]
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    try:
+        connector._step = _transport_step([_transport_request("r0", store=5)])
+        connector.bound_hook.capture_group_boundary("g2")
+    finally:
+        BOUNDARY.clear_forward_step(token)
+
+    assert [call[0] for call in codec.calls] == ["capture"]
+    view, tensor_view = codec.calls[0][1], codec.calls[0][2]
+    assert view.resource_id == _resource(2, prefix)
+    assert view.dispatch_layer == _dispatch(2, prefix)
+    assert view.execution_layer == _execution(2, prefix)
+    assert tensor_view.resource_id == _resource(2, prefix)
+
+
+def test_install_from_connector_derives_the_prefix_without_a_plan(
+    text_config, _isolated
+):
+    prefix = "language_model.model"
+    connector = _FakeConnector(prefix=prefix, plan=False)
+    model = _FakeModel(
+        [_compressor_module(layer, _ring(), prefix=prefix) for layer in BOUNDARY_LAYERS],
+        config=text_config,
+    )
+
+    # No grouped plan yet: the live compressor-state resource names are the
+    # only registered truth available, and guessing "model" would be wrong.
+    assert BOUNDARY.install_from_connector(model=model, connector=connector) is False
+    binding = SEAM.lw_v2_engine()
+    assert binding is not None and binding.prefix == prefix
 
 
 def test_install_from_connector_without_a_codec_stays_inert(text_config, caplog):
