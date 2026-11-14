@@ -311,3 +311,48 @@ index 12`（`dsv41_mp_adapter._blocks_for_engine_group`），见 EVIDENCE-t97.md
   cold（plan §6 的"无准确 C2 的 chunk 不 publish"），绝不拿后一步的 ring 冒充。
 - `restore_target` 的计划页只在"新请求正好在捕获边界续上"时成立；多请求步里
   同 token 不同页仍按歧义 fail-closed。
+
+## t120 诊断采样（t119 §4 补采样，默认关闭）
+
+三仓各放一份相同的采样核心 `dsv41_sampling.py`（stdlib-only，无循环 import）：
+
+| 仓 | 路径 |
+| --- | --- |
+| vllm-ascend | `vllm_ascend/attention/dsv41_sampling.py` |
+| LMCache-Ascend | `lmcache_ascend/integration/vllm/dsv41_sampling.py` |
+| LMCache | `lmcache/v1/multiprocess/dsv41_sampling.py` |
+
+环境开关：`DSV41_SAMPLING=1` 打开（默认关闭，`emit` 首行早退，零文件写入）；
+`DSV41_SAMPLING_DIR` 输出目录（默认 `/tmp/dsv41-sampling`）；每 (tag,pid) 一个
+`sampling-{tag}-{pid}.jsonl`；`DSV41_SAMPLING_MAX_EVENTS` 每 tag 事件上限
+（默认 200000）；`DSV41_SAMPLING_ROW_LIMIT`/`DSV41_SAMPLING_SLOT_LIMIT` 控制
+block table 行 / slot 数组有界读取（默认 256/8192）。采样只记 request_id 与
+几何量，不落 prompt 正文；`summarize_tensor` 对 torch 风格（shape/stride 为
+绑定方法）与 tuple 桩两种形态都安全（T56-01 教训）。
+
+挂点（事件名 → 位置）：
+
+- `engine` tag（vllm-ascend）：`step_bind`（c2.bind_model_forward_step，
+  real/synthetic 三态+每请求 prefix_end/首块页号）；`c2_capture`
+  （c2._record_boundary，prefix_end/end_token/ring_cursor/written_rows）；
+  `swa_write`（dsa_v41._write_swa_cache，slot_mapping 全量有界+negative 计数
+  +block_table 行+seq_lens+compress_ratio+storage_block_size）。
+- `adapter` tag（LMCache-Ascend）：`registration`（每资源 name/group/几何
+  +plan/layout hash）；`step_schedule`（每请求 RETRIEVE/STORE 合并视图）；
+  `f4_skip`（covered-only 过滤明细）；`store_payload`/`boundary_store`/
+  `boundary_cold`/`commit`（tensor/wire bytes+digest）；`bridge_resource`
+  （already_served/budget_exhausted/group_not_covered/miss/loaded）+
+  `bridge_outcome`；`restore_rows`/`restore_boundary`/`restore_token_range`
+  （目标行/页+bytes）；`lookup_submit`/`lookup_hit`/`lookup_miss`
+  （scheduler 侧）。
+- `server` tag（LMCache）：`server_register`/`server_store`/`server_retrieve`/
+  `server_commit`/`server_lookup`/`server_release`。
+
+运行脚本：`serve-with-sampling-0.30.0rc2.sh`（serve 注入采样 env）、
+`run-sampling-0.30.0rc2.sh`（cold ≥5k 跨 chunk → warm 同前缀 → 长 decode 三
+阶段）、`collect-sampling.sh`（事件计数+payload/wire bytes 分账+层/请求覆盖
++失败面汇总）。回退：unset `DSV41_SAMPLING` 即恢复生产路径，代码无行为分支
+差异（emit 禁用时早退）。
+
+聚合测试：`dsv41-layerwise/tests/test_t120_sampling.py`（默认关/开写 jsonl/
+事件上限/方法-与-tuple-两种张量形态/tensor_ints 永不抛）。

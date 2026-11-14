@@ -48,6 +48,7 @@ import torch
 
 from vllm.logger import init_logger
 
+from vllm_ascend.attention import dsv41_sampling
 from vllm_ascend.attention.dsv41_layerwise_admission import init_phase_active
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -468,6 +469,13 @@ def bind_model_forward_step(
     step_id = next_step_id()
     if init_phase_active() or decoder_replay_dummy:
         _request_pages.clear()
+        dsv41_sampling.emit(
+            "engine",
+            "step_bind",
+            step_id=step_id,
+            state="synthetic",
+            request_count=0,
+        )
         return bind_step_request_view(
             DSV41StepRequestView(
                 step_id=step_id,
@@ -488,6 +496,22 @@ def bind_model_forward_step(
         request_pages=tuple((end, page) for _rid, end, page in plan),
     )
     previous = bind_step_request_view(view)
+    dsv41_sampling.emit(
+        "engine",
+        "step_bind",
+        step_id=step_id,
+        state="real",
+        request_count=len(req_ids),
+        generation=view.generation,
+        request_pages=[
+            {
+                "request_id": rid,
+                "prefix_end": end,
+                "page": page,
+            }
+            for rid, end, page in plan[: dsv41_sampling.row_limit()]
+        ],
+    )
     try:
         admit_step(device)
     except Exception as exc:
@@ -752,6 +776,20 @@ def _record_boundary(view: DSV41BoundaryRequestView) -> None:
     while len(_boundary_records) > _BOUNDARY_RECORD_LIMIT:
         oldest = next(iter(_boundary_records))
         del _boundary_records[oldest]
+    dsv41_sampling.emit(
+        "engine",
+        "c2_capture",
+        resource_id=view.resource_id,
+        request_id=view.request_id,
+        step_id=view.step_id,
+        prefix_end=view.prefix_end,
+        end_token=record.end_token,
+        ring_cursor=record.ring_cursor,
+        compression_phase=view.compression_phase,
+        written_rows=list(view.written_rows)[: dsv41_sampling.row_limit()],
+        written_row_count=len(view.written_rows),
+        ring_rows=view.ring_rows,
+    )
 
 
 def boundary_record(

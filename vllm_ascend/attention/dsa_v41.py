@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention import dsv41_sampling
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.attention.dsv41_layerwise_admission import (
     guard_layer_admission,
@@ -394,8 +395,49 @@ class AscendDSAV41Impl:
         )
 
     @staticmethod
+    def _sample_swa_write(attn, metadata, value):
+        """Emit one bounded swa_write sampling record (t120, default off).
+
+        Captures the producer-side geometry the t119 evidence plan asked
+        for: the real slot mapping (with negative/null counts), the block
+        table rows, sequence lengths and the cache shape, so a stored
+        payload can later be mapped to the physical rows it covers.
+        """
+        if not dsv41_sampling.enabled():
+            return
+        slots = dsv41_sampling.tensor_ints(
+            metadata.slot_mapping, dsv41_sampling.slot_limit()
+        )
+        slot_total = len(slots)
+        negatives = sum(1 for s in slots if s < 0)
+        block_rows = dsv41_sampling.tensor_ints(
+            metadata.block_table, dsv41_sampling.row_limit()
+        )
+        dsv41_sampling.emit(
+            "engine",
+            "swa_write",
+            layer=str(getattr(attn, "layer_name", "") or ""),
+            value_shape=list(getattr(value, "shape", ()) or ()),
+            slot_mapping=slots,
+            slot_count=slot_total,
+            slot_negative=negatives,
+            block_table_rows=block_rows,
+            seq_lens=dsv41_sampling.tensor_ints(
+                metadata.seq_lens, dsv41_sampling.row_limit()
+            ),
+            num_reqs=int(getattr(metadata, "num_reqs", 0) or 0),
+            num_prefills=int(getattr(metadata, "num_prefills", 0) or 0),
+            num_decodes=int(getattr(metadata, "num_decodes", -1) or 0),
+            compress_ratio=int(getattr(metadata, "compress_ratio", 0) or 0),
+            storage_block_size=int(
+                getattr(metadata, "storage_block_size", 0) or 0
+            ),
+        )
+
+    @staticmethod
     def _write_swa_cache(attn, metadata, value):
         cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+        AscendDSAV41Impl._sample_swa_write(attn, metadata, value)
         backend = getattr(attn, "packed_cache_ops", None)
         if backend is not None:
             backend.write_attention_cache(
