@@ -239,16 +239,18 @@ class _FakeBlockTable:
 
 
 class _FakeInputBatch:
-    def __init__(self, req_ids, computed, pages) -> None:
+    def __init__(self, req_ids, computed, pages, prompt_tokens=None) -> None:
         self.req_ids = list(req_ids)
         self.num_reqs = len(req_ids)
         self.num_computed_tokens_cpu = np.asarray(computed, dtype=np.int32)
         self.block_table = SimpleNamespace(block_tables=[_FakeBlockTable(pages)])
+        if prompt_tokens is not None:
+            self.num_prompt_tokens = np.asarray(prompt_tokens, dtype=np.int32)
 
 
 class _FakeRunner:
-    def __init__(self, req_ids, computed, pages, query_lens) -> None:
-        self.input_batch = _FakeInputBatch(req_ids, computed, pages)
+    def __init__(self, req_ids, computed, pages, query_lens, prompt_tokens=None) -> None:
+        self.input_batch = _FakeInputBatch(req_ids, computed, pages, prompt_tokens)
         self.query_lens = torch.tensor(query_lens, dtype=torch.int32)
 
 
@@ -438,7 +440,7 @@ def test_install_from_connector_uses_the_registered_model_prefix(
     )
     token = BOUNDARY.bind_forward_step(runner)
     try:
-        connector._step = _transport_step([_transport_request("r0", store=5)])
+        connector._step = _transport_step([_transport_request("r0", store=7)])
         connector.bound_hook.capture_group_boundary("g2")
     finally:
         BOUNDARY.clear_forward_step(token)
@@ -662,10 +664,30 @@ def test_capture_keeps_the_forward_prefix_after_a_replay_hit(text_config, _isola
     BOUNDARY.clear_forward_step(token)
 
 
+def test_a_transport_capture_must_end_on_its_store_endpoint(text_config, _isolated):
+    """A replay-rewound forward that ends after the store window is not captured."""
+    connector, codec, _rings = _install(text_config, _isolated, pages=(3,))
+    runner = _FakeRunner(
+        req_ids=["r0"],
+        computed=[384],
+        pages=[3],
+        query_lens=[159],
+        prompt_tokens=[543],
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    try:
+        _isolated.attn_metadata[_resource(2)] = _metadata([3])
+        connector._step = _transport_step([_transport_request("r0", store=512)])
+        connector.bound_hook.capture_group_boundary("g2")
+        assert codec.calls == []
+    finally:
+        BOUNDARY.clear_forward_step(token)
+
+
 def test_restore_relocates_to_the_live_page_not_the_capture_page(text_config, _isolated):
     connector, codec, token = _hook_setup(text_config, _isolated, pages=(3, 7))
     connector._step = _transport_step(
-        [_transport_request("r0", store=5), _transport_request("r1")]
+        [_transport_request("r0", store=7), _transport_request("r1")]
     )
     hook = connector.bound_hook
     hook.capture_group_boundary("g2")
@@ -969,3 +991,102 @@ def test_cold_prefill_skips_an_unaligned_endpoint(text_config, _isolated):
     connector.bound_hook.capture_group_boundary("g2")
     assert codec.calls == []
     BOUNDARY.clear_forward_step(token)
+
+
+def _capture_cold_prefill_views(connector, codec, *, prompt_tokens, forwards):
+    """Run one cold prefill forward per (prefix_end, step_tokens) pair."""
+    views = []
+    for computed, tokens in forwards:
+        runner = _FakeRunner(
+            req_ids=["r0"],
+            computed=[computed],
+            pages=[3],
+            query_lens=[tokens],
+            prompt_tokens=prompt_tokens,
+        )
+        token = BOUNDARY.bind_forward_step(runner)
+        try:
+            before = len(codec.calls)
+            connector.bound_hook.capture_group_boundary("g2")
+            if len(codec.calls) > before:
+                views.append(codec.calls[-1][1])
+        finally:
+            BOUNDARY.clear_forward_step(token)
+    return views
+
+
+def test_short_prompt_captures_the_chunk_endpoint_and_not_its_tail(
+    text_config, _isolated
+):
+    """543 prompt tokens: the 512 chunk end is capturable, the 31 tail is not."""
+    connector, codec, _rings = _install(text_config, _isolated, pages=(3,))
+    views = _capture_cold_prefill_views(
+        connector,
+        codec,
+        prompt_tokens=[543],
+        forwards=[(0, 512), (512, 31)],
+    )
+    assert [view.boundary_end for view in views] == [512]
+    # The captured page is the last full ring page of the 512 token chunk.
+    assert views[0].prefix_end == 0
+    assert views[0].step_tokens == 512
+    assert views[0].next_slot == 0
+    assert views[0].written_rows == tuple(3 * 8 + row for row in range(8))
+
+
+def test_decode_step_never_captures_a_boundary_page(text_config, _isolated):
+    """A decode step must not manufacture a page beyond the prompt end."""
+    connector, codec, _rings = _install(text_config, _isolated, pages=(3,))
+    views = _capture_cold_prefill_views(
+        connector,
+        codec,
+        prompt_tokens=[543],
+        forwards=[(544, 8)],
+    )
+    assert views == []
+    assert codec.calls == []
+
+
+def test_long_prompt_captures_each_aligned_prefill_chunk(text_config, _isolated):
+    connector, codec, _rings = _install(text_config, _isolated, pages=(3,))
+    views = _capture_cold_prefill_views(
+        connector,
+        codec,
+        prompt_tokens=[9690],
+        forwards=[(0, 4096), (4096, 4096), (8192, 1280), (9472, 218)],
+    )
+    assert [view.boundary_end for view in views] == [4096, 8192, 9472]
+    assert [view.prefix_end for view in views] == [0, 4096, 8192]
+
+
+def test_missing_prompt_lengths_only_capture_the_first_chunk(text_config, _isolated):
+    """Older host batches have no prompt lengths: stay conservative."""
+    connector, codec, _rings = _install(text_config, _isolated, pages=(3,))
+    endpoints = []
+    for computed, tokens in ((0, 512), (512, 8)):
+        runner = _FakeRunner(
+            req_ids=["r0"], computed=[computed], pages=[3], query_lens=[tokens]
+        )
+        token = BOUNDARY.bind_forward_step(runner)
+        try:
+            before = len(codec.calls)
+            connector.bound_hook.capture_group_boundary("g2")
+            if len(codec.calls) > before:
+                endpoints.append(codec.calls[-1][1].boundary_end)
+        finally:
+            BOUNDARY.clear_forward_step(token)
+    assert endpoints == [512]
+
+
+def test_short_prompt_lengths_fail_closed(text_config, _isolated):
+    connector, codec, _rings = _install(text_config, _isolated)
+    runner = _FakeRunner(
+        req_ids=["r0", "r1"],
+        computed=[0, 0],
+        pages=[3, 7],
+        query_lens=[8, 8],
+        prompt_tokens=[8],
+    )
+    with pytest.raises(DSV41BoundaryStateError, match="prompt lengths"):
+        BOUNDARY.bind_forward_step(runner)
+    assert codec.calls == []

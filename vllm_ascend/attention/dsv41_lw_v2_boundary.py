@@ -292,6 +292,11 @@ class _ForwardRequest:
     out_base: int
     in_base: int
     ring_page: int
+    #: Prompt length of the request, when the host input batch exposes it.
+    #: A boundary can only be captured at the end of a forward that still
+    #: computes prompt tokens; a decode step never materializes a chunk
+    #: boundary page of its own.
+    num_prompt_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -588,10 +593,7 @@ class DSV41LwV2BoundaryHook:
                 )
             if capture_prefill:
                 endpoint = forward_request.prefix_end + forward_request.step_tokens
-                if (
-                    forward_request.step_tokens <= 0
-                    or endpoint % state.ring_rows != 0
-                ):
+                if not _is_capturable_prefill_end(forward_request, state.ring_rows):
                     continue
                 observation = (group.group_id, endpoint)
                 if observation not in _OBSERVED:
@@ -605,6 +607,14 @@ class DSV41LwV2BoundaryHook:
                         forward_request.step_tokens,
                         state.ring_rows,
                     )
+            elif action == "capture":
+                # A transport-driven capture must describe exactly the store
+                # endpoint of this step. Sharing one page with a different
+                # endpoint would attach a state that the store window never
+                # wrote and that T25-1 forbids re-labelling.
+                endpoint = forward_request.prefix_end + forward_request.step_tokens
+                if endpoint != transport_endpoint:
+                    continue
             view = _request_view(
                 state,
                 forward_request,
@@ -1031,6 +1041,32 @@ def _written_rows(
     return tuple(page_start + (first_token + offset) % ring_rows for offset in range(tail))
 
 
+def _is_capturable_prefill_end(request: _ForwardRequest, ring_rows: int) -> bool:
+    """Whether this forward ends on a chunk boundary while still prefilling.
+
+    A boundary payload describes the ring page at a chunk endpoint, and the
+    page only survives while the forward ends on that endpoint. Two conditions
+    follow:
+
+    * every token of the chunk is a prompt token (``prefix + step <= prompt``),
+      so a decode step never manufactures a chunk page it did not compute; and
+    * the endpoint is page aligned, so the captured page is a full ring page.
+
+    Without the prompt length (older host batches) only the first prefill chunk
+    is accepted, which is the only chunk whose end is known to be a prompt end
+    position without extra scheduler facts.
+    """
+    if request.step_tokens <= 0:
+        return False
+    endpoint = request.prefix_end + request.step_tokens
+    if endpoint % ring_rows != 0:
+        return False
+    prompt_tokens = request.num_prompt_tokens
+    if prompt_tokens is None:
+        return request.prefix_end == 0
+    return endpoint <= prompt_tokens
+
+
 def _read_forward_step(runner: Any, step_id: int) -> _ForwardStep:
     input_batch = getattr(runner, "input_batch", None)
     if input_batch is None:
@@ -1071,6 +1107,7 @@ def _read_forward_step(runner: Any, step_id: int) -> _ForwardStep:
             "host scheduler arrays are shorter than the bound request count"
         )
     block_tables = _host_block_table(input_batch)
+    prompt_lengths = _host_prompt_lengths(input_batch, num_reqs)
     requests = []
     out_base = 0
     for index in range(num_reqs):
@@ -1080,6 +1117,7 @@ def _read_forward_step(runner: Any, step_id: int) -> _ForwardStep:
                 f"request {request_ids[index]!r} schedules a negative token count"
             )
         page = int(block_tables[index, 0]) if tokens > 0 else 0
+        prompt_tokens = int(prompt_lengths[index]) if prompt_lengths is not None else None
         requests.append(
             _ForwardRequest(
                 request_id=request_ids[index],
@@ -1089,10 +1127,29 @@ def _read_forward_step(runner: Any, step_id: int) -> _ForwardStep:
                 out_base=out_base,
                 in_base=out_base,
                 ring_page=page,
+                num_prompt_tokens=prompt_tokens,
             )
         )
         out_base += tokens
     return _ForwardStep(step_id=step_id, requests=tuple(requests))
+
+
+def _host_prompt_lengths(input_batch: Any, num_reqs: int) -> np.ndarray | None:
+    """Host prompt lengths of the bound requests, or None when unavailable.
+
+    The input batch exposes ``num_prompt_tokens`` as a host array. Older or
+    restricted host batches may not carry it; the boundary hook then falls back
+    to the first prefill chunk only (see ``_is_capturable_prefill_end``).
+    """
+    raw = getattr(input_batch, "num_prompt_tokens", None)
+    if raw is None:
+        return None
+    prompt_lengths = _host_int_array(raw, "num_prompt_tokens")
+    if prompt_lengths.shape[0] < num_reqs:
+        raise DSV41BoundaryStateError(
+            "host prompt lengths are shorter than the bound request count"
+        )
+    return prompt_lengths
 
 
 def _host_int_array(value: Any, name: str, *, ndim: int = 1) -> np.ndarray:

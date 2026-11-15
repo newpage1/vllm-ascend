@@ -20,6 +20,11 @@ import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_glm53_reasoning  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
 import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
+
+# Must follow the mamba split patch: layerwise v2 wraps the current split and
+# delegates mamba models to it.
+import vllm_ascend.patch.platform.patch_dsv41_lw_v2_prefill_split  # noqa
+
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_parallel_config  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
