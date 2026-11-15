@@ -32,6 +32,27 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol
 
+try:  # pragma: no cover - the fallback only exists for stripped test packages
+    from vllm_ascend.attention import dsv41_lw_v2_trace as _trace
+except ImportError:  # the trace sink is an optional, default-off observer
+
+    class _NoTrace:
+        """No-op sink used when the repo is loaded module-by-module in tests."""
+
+        @staticmethod
+        def enabled() -> bool:
+            return False
+
+        @staticmethod
+        def emit(*args, **kwargs) -> None:
+            return None
+
+        @staticmethod
+        def now_ns() -> int:
+            return 0
+
+    _trace = _NoTrace()  # type: ignore[assignment]
+
 from vllm_ascend.models.deepseek_v41.topology import (
     DSV41_LW_V2_SOURCE_LAYERS,
     DeepseekV41Topology,
@@ -176,6 +197,24 @@ def unbind_lw_v2_engine() -> None:
     _engine_binding = None
 
 
+def _trace_fields(binding: DSV41LwV2EngineBinding, group) -> dict:
+    """Fields both forward events carry (step/request when one is bound)."""
+    step = getattr(binding.hooks, "current_step", None)
+    step_id = None
+    request_ids: list[str] = []
+    if step is not None:
+        step_id = getattr(step, "step_id", None)
+        for request in getattr(step, "requests", ()) or ():
+            request_id = getattr(request, "request_id", None)
+            if isinstance(request_id, str):
+                request_ids.append(request_id)
+    return {
+        "step_id": step_id,
+        "group_id": group.group_id,
+        "request_ids": request_ids,
+    }
+
+
 def run_group_forward(
     binding: DSV41LwV2EngineBinding,
     dispatch_layer_name: str,
@@ -209,13 +248,46 @@ def run_group_forward(
             dispatch_layer_name,
         )
     hooks = binding.hooks
-    hooks.wait_group_load(group.group_id)
-    if group.has_boundary:
-        hooks.restore_group_boundary(group.group_id)
-    forward()
-    if group.has_boundary:
-        hooks.capture_group_boundary(group.group_id)
-    hooks.submit_group_store(group.group_id)
+    traced = _trace.enabled()
+    forward_start = 0
+    if traced:
+        fields = _trace_fields(binding, group)
+        fields["layer"] = dispatch_layer_name
+        fields["phase"] = "forward"
+        fields["has_boundary"] = group.has_boundary
+        forward_start = _trace.now_ns()
+        _trace.emit("forward_start", **fields)
+    ok = False
+    try:
+        hooks.wait_group_load(group.group_id)
+        if group.has_boundary:
+            hooks.restore_group_boundary(group.group_id)
+        compute_start = 0
+        if traced:
+            fields = _trace_fields(binding, group)
+            fields["layer"] = dispatch_layer_name
+            fields["phase"] = "compute"
+            compute_start = _trace.now_ns()
+            _trace.emit("compute_start", **fields)
+        forward()
+        if traced:
+            fields = _trace_fields(binding, group)
+            fields["layer"] = dispatch_layer_name
+            fields["phase"] = "compute"
+            fields["elapsed_ns"] = _trace.now_ns() - compute_start
+            _trace.emit("compute_end", **fields)
+        if group.has_boundary:
+            hooks.capture_group_boundary(group.group_id)
+        hooks.submit_group_store(group.group_id)
+        ok = True
+    finally:
+        if traced:
+            fields = _trace_fields(binding, group)
+            fields["layer"] = dispatch_layer_name
+            fields["phase"] = "forward"
+            fields["ok"] = ok
+            fields["elapsed_ns"] = _trace.now_ns() - forward_start
+            _trace.emit("forward_end", **fields)
 
 
 __all__ = [
