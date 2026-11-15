@@ -529,14 +529,14 @@ class DSV41LwV2BoundaryHook:
         capture_prefill = False
         if action == "restore":
             step = _current_transport_step(self._connector, group_id)
-            request_ids = _target_request_ids(step, action)
+            targets = _target_requests(step, action)
             registration_epoch = int(getattr(step, "registration_epoch", 0) or 0)
             server_generation = int(getattr(step, "server_generation", 0) or 0)
         else:
             step = getattr(self._connector, "current_step", None)
             synthetic = bool(getattr(step, "synthetic", False)) if step else False
             if step is not None and not synthetic:
-                request_ids = _target_request_ids(step, action)
+                targets = _target_requests(step, action)
                 registration_epoch = int(
                     getattr(step, "registration_epoch", 0) or 0
                 )
@@ -550,8 +550,8 @@ class DSV41LwV2BoundaryHook:
                 # window that later matches the endpoint attaches the payload,
                 # and an unaligned endpoint is never re-labelled (T25-1).
                 capture_prefill = True
-                request_ids = tuple(
-                    request.request_id for request in forward_step.requests
+                targets = tuple(
+                    (request.request_id, 0) for request in forward_step.requests
                 )
                 registration_epoch = int(
                     getattr(self._connector, "registration_epoch", 0) or 0
@@ -559,7 +559,7 @@ class DSV41LwV2BoundaryHook:
                 server_generation = int(
                     getattr(self._connector, "server_generation", 0) or 0
                 )
-        if not request_ids:
+        if not targets:
             return
         attn = _attention_for(group)
         state = _ring_state(group, attn)
@@ -579,7 +579,7 @@ class DSV41LwV2BoundaryHook:
             raise DSV41BoundaryBindingError(
                 f"boundary codec is missing {action}_layer_boundary"
             )
-        for request_id in request_ids:
+        for request_id, transport_endpoint in targets:
             forward_request = requests_by_id.get(request_id)
             if forward_request is None:
                 raise DSV41BoundaryStateError(
@@ -612,6 +612,7 @@ class DSV41LwV2BoundaryHook:
                 registration_epoch=registration_epoch,
                 server_generation=server_generation,
                 ring_page=int(state.tensor_view.page_ids[forward_request.request_index]),
+                prefix_end=transport_endpoint if action == "restore" else None,
             )
             try:
                 method(view, state.tensor_view, stream=None)
@@ -823,19 +824,30 @@ def _current_transport_step(connector: Any, group_id: str) -> Any:
     return step
 
 
-def _target_request_ids(step: Any, action: str) -> tuple[str, ...]:
-    """Real hit (restore) or store (capture) requests of this transport step."""
+def _target_requests(step: Any, action: str) -> tuple[tuple[str, int], ...]:
+    """Real hit (restore) or store (capture) requests of this transport step.
+
+    Each entry carries the logical prefix end the transport step serves for
+    that request: ``load_prefix_end`` for a hit, ``store_prefix_end`` for a
+    store.  A restore presents the *hit* endpoint to the codec, because the
+    boundary page was captured there, the payload is keyed there and the codec
+    validates the page's ``boundary_end`` against it.  The forward's own
+    prefix can be smaller when SWA bounded replay rewinds the hit; that replay
+    start is an engine fact, not the boundary's endpoint.
+    """
     field_name = "load_prefix_end" if action == "restore" else "store_prefix_end"
-    request_ids = []
+    targets: list[tuple[str, int]] = []
     for request in getattr(step, "requests", ()) or ():
-        if int(getattr(request, field_name, 0) or 0) > 0:
-            request_id = getattr(request, "request_id", None)
-            if not isinstance(request_id, str) or not request_id:
-                raise DSV41BoundaryStateError(
-                    f"transport step carries a {action} request without an id"
-                )
-            request_ids.append(request_id)
-    return tuple(request_ids)
+        endpoint = int(getattr(request, field_name, 0) or 0)
+        if endpoint <= 0:
+            continue
+        request_id = getattr(request, "request_id", None)
+        if not isinstance(request_id, str) or not request_id:
+            raise DSV41BoundaryStateError(
+                f"transport step carries a {action} request without an id"
+            )
+        targets.append((request_id, endpoint))
+    return tuple(targets)
 
 
 def _attention_for(group: DeepseekV41TransferGroup) -> Any:
@@ -956,8 +968,18 @@ def _request_view(
     registration_epoch: int,
     server_generation: int,
     ring_page: int | None = None,
+    prefix_end: int | None = None,
 ) -> BoundaryRequestView:
-    prefix_end = forward_request.prefix_end
+    """Describe one request's boundary plane for a capture or a restore.
+
+    ``prefix_end`` overrides the forward's computed-token prefix for a
+    restore: a hit rewound by SWA bounded replay runs from an earlier prefix,
+    while the boundary page it restores is the one captured at the hit
+    endpoint.  The page geometry (page, rows, slot, phase) follows whichever
+    prefix the view describes.
+    """
+    if prefix_end is None:
+        prefix_end = forward_request.prefix_end
     step_tokens = forward_request.step_tokens
     if ring_page is None:
         ring_page = forward_request.ring_page

@@ -619,6 +619,49 @@ def test_restore_hands_the_codec_real_live_facts(text_config, _isolated):
     BOUNDARY.clear_forward_step(token)
 
 
+def test_restore_uses_the_transport_hit_endpoint_after_replay_rewind(text_config, _isolated):
+    connector, codec, _rings = _install(text_config, _isolated)
+    # SWA bounded replay rewinds the hit to 384 and only 128 tokens run, but
+    # the boundary page was captured at the 512-token hit endpoint.
+    runner = _FakeRunner(
+        req_ids=["r0"], computed=[384], pages=[3], query_lens=[128]
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    _isolated.attn_metadata[_resource(2)] = _metadata([3])
+    connector._step = _transport_step([_transport_request("r0", load=512)])
+    connector.bound_hook.restore_group_boundary("g2")
+
+    action, view, _tensor_view = codec.calls[0]
+    assert action == "restore"
+    # The codec keys boundary payloads by the load endpoint and validates the
+    # envelope's boundary_end against view.prefix_end, so the restore view must
+    # describe the hit endpoint rather than the rewound forward prefix.
+    assert (view.prefix_end, view.step_tokens, view.boundary_end) == (512, 128, 640)
+    assert view.ring_page == 3
+    assert view.next_slot == 0 and view.compression_phase == 0
+    # Same live ring rows as the rewound forward (512 and 384 agree modulo the
+    # 32-row ring and the ratio-2 phase).
+    assert view.written_rows == tuple(3 * 8 + row for row in range(8))
+    assert view.position_control == (512, 128, 0, 0, 3)
+    BOUNDARY.clear_forward_step(token)
+
+
+def test_capture_keeps_the_forward_prefix_after_a_replay_hit(text_config, _isolated):
+    connector, codec, _rings = _install(text_config, _isolated)
+    runner = _FakeRunner(
+        req_ids=["r0"], computed=[384], pages=[3], query_lens=[128]
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    _isolated.attn_metadata[_resource(2)] = _metadata([3])
+    connector._step = _transport_step([_transport_request("r0", store=512)])
+    connector.bound_hook.capture_group_boundary("g2")
+
+    _action, view, _tensor_view = codec.calls[0]
+    assert (view.prefix_end, view.step_tokens, view.boundary_end) == (384, 128, 512)
+    assert view.next_slot == 0
+    BOUNDARY.clear_forward_step(token)
+
+
 def test_restore_relocates_to_the_live_page_not_the_capture_page(text_config, _isolated):
     connector, codec, token = _hook_setup(text_config, _isolated, pages=(3, 7))
     connector._step = _transport_step(
