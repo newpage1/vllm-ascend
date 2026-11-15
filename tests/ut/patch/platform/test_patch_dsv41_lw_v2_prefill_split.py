@@ -183,6 +183,93 @@ def test_explicit_chunk_wins_over_the_connector():
     assert MOD._resolve_boundary_chunk(scheduler) == 128
 
 
+def test_resolve_ignores_a_stock_connector_chunk():
+    """A stock LMCache connector also reports a chunk; it must never opt in."""
+    scheduler = SimpleNamespace(
+        vllm_config=_engine(connector="LMCacheMPConnector", extra_config={"dsv41.lw_v2": True}),
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=256)),
+    )
+    assert MOD._resolve_boundary_chunk(scheduler) == 0
+
+
+def test_resolve_ignores_a_stock_connector_without_a_flag():
+    scheduler = SimpleNamespace(
+        vllm_config=_engine(connector="LMCacheMPConnector"),
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=256)),
+    )
+    assert MOD._resolve_boundary_chunk(scheduler) == 0
+
+
+def test_resolve_ignores_a_v2_name_without_the_flag():
+    scheduler = SimpleNamespace(
+        vllm_config=_engine(extra_config={}),
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=256)),
+    )
+    assert MOD._resolve_boundary_chunk(scheduler) == 0
+
+
+def test_resolve_uses_the_connector_chunk_for_a_v2_engine():
+    scheduler = SimpleNamespace(
+        vllm_config=_engine(extra_config={"dsv41.lw_v2": True}),
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=256)),
+    )
+    assert MOD._resolve_boundary_chunk(scheduler) == 256
+
+
+def test_explicit_override_does_not_apply_to_a_stock_connector():
+    config = _engine(
+        connector="LMCacheMPConnector",
+        extra_config={"dsv41.lw_v2": True, "dsv41.lw_v2.boundary_chunk_size": 128},
+    )
+    assert MOD._lw_v2_boundary_chunk(config) == 0
+    scheduler = SimpleNamespace(
+        vllm_config=config,
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=256)),
+    )
+    assert MOD._resolve_boundary_chunk(scheduler) == 0
+
+
+def _init_scheduler(monkeypatch, *, vllm_config, connector_chunk: int):
+    monkeypatch.setattr(MOD, "_original_scheduler_init", lambda self, *args, **kwargs: None)
+    scheduler = SimpleNamespace(
+        vllm_config=vllm_config,
+        connector=SimpleNamespace(scheduler_adapter=SimpleNamespace(lmcache_tokens_per_chunk=connector_chunk)),
+        has_mamba_layers=False,
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+    )
+    MOD._scheduler_init(scheduler, None)
+    return scheduler
+
+
+def test_scheduler_init_leaves_a_stock_connector_unsplit(monkeypatch):
+    """F1: stock LMCache + chunked prefill + non-mamba must keep vLLM's chunking."""
+    scheduler = _init_scheduler(
+        monkeypatch,
+        vllm_config=_engine(connector="LMCacheMPConnector", extra_config={"dsv41.lw_v2": True}),
+        connector_chunk=256,
+    )
+    assert not hasattr(scheduler, "_dsv41_lw_v2_boundary_chunk")
+    assert not hasattr(scheduler, "need_mamba_block_aligned_split")
+    monkeypatch.setattr(MOD, "_original_block_aligned_split", lambda *args: args[2])
+    assert MOD._mamba_block_aligned_split(
+        scheduler, _request(computed=0, num_prompt_tokens=543), 543
+    ) == 543
+
+
+def test_scheduler_init_splits_a_v2_engine_with_a_connector_chunk(monkeypatch):
+    scheduler = _init_scheduler(
+        monkeypatch,
+        vllm_config=_engine(extra_config={"dsv41.lw_v2": True}),
+        connector_chunk=256,
+    )
+    assert scheduler._dsv41_lw_v2_boundary_chunk == 256
+    assert scheduler.need_mamba_block_aligned_split is True
+    monkeypatch.setattr(MOD, "_original_block_aligned_split", lambda *args: args[2])
+    assert MOD._mamba_block_aligned_split(
+        scheduler, _request(computed=0, num_prompt_tokens=543), 543
+    ) == 512
+
+
 # --------------------------------------------------------------------------
 # Chunk arithmetic.
 # --------------------------------------------------------------------------

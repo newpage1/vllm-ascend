@@ -68,24 +68,38 @@ _original_scheduler_init = Scheduler.__init__
 _original_block_aligned_split = Scheduler._mamba_block_aligned_split
 
 
-def _lw_v2_boundary_chunk(vllm_config: Any) -> int:
-    """Return the configured layerwise v2 boundary chunk size, or 0.
+def _lw_v2_engine_config(vllm_config: Any) -> Any | None:
+    """Return the KV transfer config of a layerwise v2 engine, or ``None``.
 
-    Only a layerwise v2 engine is eligible: the connector name and the JSON
-    ``true`` flag must both match, exactly like the connector's own gate. A
-    non-integer or non-positive override is ignored (0 disables the patch).
+    This is the single eligibility gate of the patch, mirroring the connector's
+    own opt-in: the connector name and the JSON ``true`` flag must both match.
+    Callers must check it *before* reading any chunk size, so a stock LMCache
+    deployment that happens to negotiate ``lmcache_tokens_per_chunk`` can never
+    be split.
     """
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:
-        return 0
+        return None
     if getattr(kv_transfer_config, "kv_connector", None) != _DSV41_LW_V2_CONNECTOR:
-        return 0
+        return None
     extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None)
     if not isinstance(extra_config, Mapping):
-        return 0
+        return None
     if extra_config.get(_DSV41_LW_V2_FLAG) is not True:
+        return None
+    return kv_transfer_config
+
+
+def _lw_v2_boundary_chunk(vllm_config: Any) -> int:
+    """Return the configured layerwise v2 boundary chunk override, or 0.
+
+    Only a layerwise v2 engine is eligible (see ``_lw_v2_engine_config``). A
+    non-integer or non-positive override is ignored (0 disables the patch).
+    """
+    kv_transfer_config = _lw_v2_engine_config(vllm_config)
+    if kv_transfer_config is None:
         return 0
-    configured = extra_config.get(_DSV41_LW_V2_CHUNK_KEY)
+    configured = kv_transfer_config.kv_connector_extra_config.get(_DSV41_LW_V2_CHUNK_KEY)
     if isinstance(configured, bool) or not isinstance(configured, int):
         return 0
     return configured if configured > 0 else 0
@@ -102,10 +116,19 @@ def _connector_boundary_chunk(scheduler: Any) -> int:
 
 
 def _resolve_boundary_chunk(scheduler: Any) -> int:
-    """Pick the boundary chunk for ``scheduler``; 0 means "leave vLLM alone"."""
-    chunk = _lw_v2_boundary_chunk(getattr(scheduler, "vllm_config", None))
-    if chunk > 0:
-        return chunk
+    """Pick the boundary chunk for ``scheduler``; 0 means "leave vLLM alone".
+
+    The engine must be layerwise v2 *before* any chunk is read: the connector
+    fallback exists only for a v2 engine whose connector negotiated the chunk
+    (``DSV41LwV2Connector`` keeps the stock attribute name). A stock LMCache
+    engine therefore resolves to 0 even when its connector reports a chunk.
+    """
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    if _lw_v2_engine_config(vllm_config) is None:
+        return 0
+    override = _lw_v2_boundary_chunk(vllm_config)
+    if override > 0:
+        return override
     return _connector_boundary_chunk(scheduler)
 
 
