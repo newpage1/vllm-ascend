@@ -26,6 +26,7 @@ global state in this module, mirroring the module-level registry pattern the
 stock layerwise hooks already use; every other value is passed explicitly.
 """
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -38,6 +39,10 @@ from vllm_ascend.models.deepseek_v41.topology import (
     build_transfer_groups,
     validate_lw_v2_topology,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
+_OBSERVED: set[tuple[str, str]] = set()
 
 
 class DSV41LwV2GroupHooks(Protocol):
@@ -195,6 +200,14 @@ def run_group_forward(
     if group is None:
         forward()
         return
+    observation = (group.group_id, dispatch_layer_name)
+    if observation not in _OBSERVED:
+        _OBSERVED.add(observation)
+        _LOGGER.warning(
+            "dsv41 lw v2 group head invoked group=%s layer=%s",
+            group.group_id,
+            dispatch_layer_name,
+        )
     hooks = binding.hooks
     hooks.wait_group_load(group.group_id)
     if group.has_boundary:

@@ -632,6 +632,8 @@ def test_restore_relocates_to_the_live_page_not_the_capture_page(text_config, _i
 
     runner = _FakeRunner(req_ids=["r0", "r1"], computed=[5, 9], pages=[7, 3], query_lens=[2, 3])
     token = BOUNDARY.bind_forward_step(runner)
+    # The compressor metadata is per-forward: rebuild it with the new pages.
+    _isolated.attn_metadata[_resource(2)] = _metadata([7, 3])
     connector._step = _transport_step([_transport_request("r0", load=5)])
     hook.restore_group_boundary("g2")
     restore_view = codec.calls[-1][1]
@@ -889,3 +891,38 @@ def test_model_runner_wires_binds_and_clears_the_v2_step():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert {"bind_forward_step", "clear_forward_step", "install_from_connector"} <= calls
+
+
+def test_cold_prefill_captures_without_a_transport_step(text_config, _isolated):
+    """vLLM 0.30 runs start_load_kv after the prefill forward.
+
+    The cold prefill therefore has no transport step yet. The hook must
+    capture from the live forward batch at a chunk-aligned endpoint so the
+    post-forward store window can attach the payload later.
+    """
+    connector, codec, _rings = _install(text_config, _isolated)
+    assert connector.current_step is None
+    runner = _FakeRunner(
+        req_ids=["r0", "r1"], computed=[0, 0], pages=[3, 7], query_lens=[8, 8]
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    connector.bound_hook.capture_group_boundary("g2")
+    assert [call[0] for call in codec.calls] == ["capture", "capture"]
+    view = codec.calls[0][1]
+    assert view.request_id == "r0"
+    assert view.prefix_end == 0
+    assert view.step_tokens == 8
+    assert view.boundary_end == 8
+    BOUNDARY.clear_forward_step(token)
+
+
+def test_cold_prefill_skips_an_unaligned_endpoint(text_config, _isolated):
+    connector, codec, _rings = _install(text_config, _isolated)
+    assert connector.current_step is None
+    runner = _FakeRunner(
+        req_ids=["r0", "r1"], computed=[0, 0], pages=[3, 7], query_lens=[7, 7]
+    )
+    token = BOUNDARY.bind_forward_step(runner)
+    connector.bound_hook.capture_group_boundary("g2")
+    assert codec.calls == []
+    BOUNDARY.clear_forward_step(token)

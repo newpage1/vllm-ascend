@@ -44,6 +44,7 @@ from vllm_ascend.models.deepseek_v41.topology import (
 )
 
 logger = logging.getLogger(__name__)
+_OBSERVED: set[tuple[str, int]] = set()
 
 #: Boundary source layers are exactly the three groups that own a
 #: ``compressor.state_cache`` resource (g2, g8, g14). g20 has no boundary.
@@ -519,17 +520,46 @@ class DSV41LwV2BoundaryHook:
                 f"group {group_id!r} declares no boundary resource; the connector "
                 "must not restore or capture one"
             )
-        step = _current_transport_step(self._connector, group_id)
         forward_step = _forward_step
         if forward_step is None or forward_step.synthetic:
             raise DSV41BoundaryStateError(
                 f"group {group_id} reached its boundary {action} without a real "
                 "forward step binding"
             )
-        request_ids = _target_request_ids(step, action)
+        capture_prefill = False
+        if action == "restore":
+            step = _current_transport_step(self._connector, group_id)
+            request_ids = _target_request_ids(step, action)
+            registration_epoch = int(getattr(step, "registration_epoch", 0) or 0)
+            server_generation = int(getattr(step, "server_generation", 0) or 0)
+        else:
+            step = getattr(self._connector, "current_step", None)
+            synthetic = bool(getattr(step, "synthetic", False)) if step else False
+            if step is not None and not synthetic:
+                request_ids = _target_request_ids(step, action)
+                registration_epoch = int(
+                    getattr(step, "registration_epoch", 0) or 0
+                )
+                server_generation = int(
+                    getattr(step, "server_generation", 0) or 0
+                )
+            else:
+                # vLLM 0.30 builds store metadata only after the prefill
+                # forward, so the cold prefill captures from the live forward
+                # batch.  Only chunk-aligned endpoints are captured; the store
+                # window that later matches the endpoint attaches the payload,
+                # and an unaligned endpoint is never re-labelled (T25-1).
+                capture_prefill = True
+                request_ids = tuple(
+                    request.request_id for request in forward_step.requests
+                )
+                registration_epoch = int(
+                    getattr(self._connector, "registration_epoch", 0) or 0
+                )
+                server_generation = int(
+                    getattr(self._connector, "server_generation", 0) or 0
+                )
         if not request_ids:
-            # The connector only calls a boundary hook for real hit/store
-            # requests, so an empty set is an explicit no-op, never a guess.
             return
         attn = _attention_for(group)
         state = _ring_state(group, attn)
@@ -549,8 +579,6 @@ class DSV41LwV2BoundaryHook:
             raise DSV41BoundaryBindingError(
                 f"boundary codec is missing {action}_layer_boundary"
             )
-        registration_epoch = int(getattr(step, "registration_epoch", 0) or 0)
-        server_generation = int(getattr(step, "server_generation", 0) or 0)
         for request_id in request_ids:
             forward_request = requests_by_id.get(request_id)
             if forward_request is None:
@@ -558,12 +586,32 @@ class DSV41LwV2BoundaryHook:
                     f"group {group_id} boundary {action} targets request "
                     f"{request_id!r}, which is not part of this forward"
                 )
+            if capture_prefill:
+                endpoint = forward_request.prefix_end + forward_request.step_tokens
+                if (
+                    forward_request.step_tokens <= 0
+                    or endpoint % state.ring_rows != 0
+                ):
+                    continue
+                observation = (group.group_id, endpoint)
+                if observation not in _OBSERVED:
+                    _OBSERVED.add(observation)
+                    logger.warning(
+                        "dsv41 lw v2 boundary capture group=%s request=%s "
+                        "endpoint=%s step_tokens=%s ring_rows=%s",
+                        group.group_id,
+                        request_id,
+                        endpoint,
+                        forward_request.step_tokens,
+                        state.ring_rows,
+                    )
             view = _request_view(
                 state,
                 forward_request,
                 step_id=forward_step.step_id,
                 registration_epoch=registration_epoch,
                 server_generation=server_generation,
+                ring_page=int(state.tensor_view.page_ids[forward_request.request_index]),
             )
             try:
                 method(view, state.tensor_view, stream=None)
@@ -907,10 +955,16 @@ def _request_view(
     step_id: int,
     registration_epoch: int,
     server_generation: int,
+    ring_page: int | None = None,
 ) -> BoundaryRequestView:
     prefix_end = forward_request.prefix_end
     step_tokens = forward_request.step_tokens
-    ring_page = forward_request.ring_page
+    if ring_page is None:
+        ring_page = forward_request.ring_page
+    if ring_page < 0:
+        raise DSV41BoundaryStateError(
+            f"request index {forward_request.request_index} has no live boundary page"
+        )
     ring_rows = state.ring_rows
     control = (
         prefix_end,
